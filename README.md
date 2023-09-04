@@ -25,11 +25,16 @@ Mem4J is a powerful and flexible library that leverages the capabilities of JNA 
     <plugin>
         <groupId>com.github.christopherproject</groupId>
         <artifactId>Mem4J</artifactId>
-        <!-- Use the latest released version:
-        https://repo1.maven.org/maven2/com/github/christopherproject/Mem4J/ -->
         <version>LATEST_VERSION</version>
-        ...
     </plugin>
+</plugins>
+
+<dependency>
+<!-- https://repo1.maven.org/maven2/com/github/christopherproject/Mem4J/ -->
+    <groupId>com.github.christopherproject</groupId>
+    <artifactId>Mem4J</artifactId>
+    <version>master</version>
+</dependency>
 ...
 ```
 
