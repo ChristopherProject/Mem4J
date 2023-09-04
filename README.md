@@ -34,3 +34,5 @@ Mem4J is a powerful and flexible library that leverages the capabilities of JNA 
 - Princekin (He Helped me to know what jna is)
 - Foiks (He Helped me and give me some self-confidence for do this)
 - Backq (He Helped me to know memory, offsets and signatures)
+
+# REQUIRES JAVA 11
