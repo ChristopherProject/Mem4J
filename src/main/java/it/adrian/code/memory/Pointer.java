@@ -85,7 +85,7 @@ public class Pointer {
 
 
     public float readFloat() {
-        Memory memory = getMemory(8);
+        Memory memory = getMemory(4);
         return memory.getFloat(0);
     }
 
@@ -102,17 +102,19 @@ public class Pointer {
     }
 
     public boolean writeFloat(float value) {
-        Memory memory = new Memory(8);
+        Memory memory = new Memory(4);
         memory.setFloat(0, value);
         com.sun.jna.Pointer src = baseAddress.share(offset);
-        return Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 8, null);
+        IntByReference intRef = new IntByReference();
+        return Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 4, intRef);
     }
 
     public boolean writeDouble(double value) {
         Memory memory = new Memory(8);
         memory.setDouble(0, value);
         com.sun.jna.Pointer src = baseAddress.share(offset);
-        return Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 8, null);
+        IntByReference intRef = new IntByReference();
+        return Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 8, intRef);
     }
 
     public boolean writeLong(long value) {

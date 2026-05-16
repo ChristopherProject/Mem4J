@@ -6,7 +6,7 @@
 
     <groupId>it.adrian.code</groupId>
     <artifactId>Mem4J</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.0.0</version>
 
     <properties>
         <maven.compiler.source>11</maven.compiler.source>

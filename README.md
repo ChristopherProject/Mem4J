@@ -11,22 +11,26 @@ Mem4J is a powerful and flexible library that leverages the capabilities of JNA 
 
 ## Installation
 ```xml
-    <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
-        <repository>
-            <id>jitpack.io</id>
-            <url>https://jitpack.io</url>
-        </repository>
-      <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
-<dependency>
-<!-- https://repo1.maven.org/maven2/com/github/christopherproject/Mem4J/ -->
-    <groupId>com.github.christopherproject</groupId>
-    <artifactId>Mem4J</artifactId>
-    <version>master</version>
-</dependency>
-...
+<properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+</properties>
+
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+
+<dependencies>
+    <dependency>
+        <groupId>com.github.christopherproject</groupId>
+        <artifactId>Mem4J</artifactId>
+        <version>1.0.0</version>
+    </dependency>
+</dependencies>
 ```
 
 ## Credits
