@@ -67,7 +67,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.christopherproject:Mem4J:1.0.0'
+    implementation 'com.github.christopherproject:Mem4J:1.0.1'
 }
 ```
 
