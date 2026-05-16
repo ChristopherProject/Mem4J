@@ -1,8 +1,11 @@
 # Mem4J — Memory Manipulation Library for Java
 
-Mem4J is a Java library that exposes Windows process memory primitives through [JNA](https://github.com/java-native-access/jna). It lets you attach to a running process, resolve module base addresses, follow pointer chains, read and write typed values, and locate addresses by byte signatures — entirely from Java, without writing C++ or maintaining a JNI bridge.
+Mem4J is a Java library that exposes process memory primitives — attaching to a running process, resolving module base addresses, following pointer chains, reading and writing typed values, and locating addresses by byte signatures — entirely from Java, without writing C++ or maintaining a JNI bridge.
 
-The library wraps the Win32 APIs `OpenProcess`, `ReadProcessMemory`, `WriteProcessMemory`, `CreateToolhelp32Snapshot`, `Module32First/NextW`, and `Process32NextW` behind a small, opinionated API centered on a `Pointer` abstraction.
+It runs on **both Windows and Linux** behind the same `Pointer` / `Memory` API. The platform-specific layer is selected at runtime via a `NativeAccess` abstraction:
+
+- On **Windows** it wraps the Win32 APIs `OpenProcess`, `ReadProcessMemory`, `WriteProcessMemory`, `CreateToolhelp32Snapshot`, `Module32First/NextW`, and `Process32NextW` through [JNA](https://github.com/java-native-access/jna).
+- On **Linux** it uses `/proc/<pid>/maps` for module discovery and `/proc/<pid>/mem` for memory I/O. Process lookup is performed via `/proc/<pid>/comm` and the `/proc/<pid>/exe` symlink.
 
 ---
 
@@ -22,9 +25,9 @@ The library wraps the Win32 APIs `OpenProcess`, `ReadProcessMemory`, `WriteProce
 | Component         | Version / Note                                                |
 |-------------------|---------------------------------------------------------------|
 | Java              | **11 or higher** (uses `ProcessHandle`, available since Java 9; project targets Java 11) |
-| Operating system  | **Windows only** (uses `kernel32.dll`, `user32.dll`, `shell32.dll`) |
-| Architecture      | The JVM bitness **must match** the target process. A 32-bit JVM cannot read/write a 64-bit process and vice versa — `ReadProcessMemory`/`WriteProcessMemory` will fail. Use a 64-bit JDK against 64-bit targets. |
-| Privileges        | **Administrator** (the library aborts otherwise via `Shell32.IsUserAnAdmin`) |
+| Operating system  | **Windows** (`kernel32.dll`, `user32.dll`, `shell32.dll`) **or Linux** (`/proc/<pid>/{maps,mem,comm,exe}` + `libc` for `geteuid`) |
+| Architecture      | The JVM bitness **must match** the target process. A 32-bit JVM cannot read/write a 64-bit process and vice versa. Use a 64-bit JDK against 64-bit targets. |
+| Privileges        | **Windows:** Administrator (checked via `Shell32.IsUserAnAdmin`). **Linux:** `euid == 0` (root) or the JVM granted `CAP_SYS_PTRACE`. The library aborts otherwise. |
 | Runtime deps      | `net.java.dev.jna:jna:5.12.1`, `net.java.dev.jna:jna-platform:5.12.1` |
 
 ---
@@ -72,6 +75,20 @@ You can also pin to a branch (e.g. `master-SNAPSHOT`) or a specific commit hash 
 
 ---
 
+## Architecture
+
+Platform dispatch is centralised in `it.adrian.code.platform.NativeAccess`. The first call to `NativeAccess.get()` inspects `com.sun.jna.Platform` and reflectively loads exactly one backend, so the unused backend's classes (and its native libraries) are never initialised:
+
+```
+NativeAccess (abstract)
+ ├── WindowsAccess  → kernel32 / user32 / shell32 via JNA
+ └── LinuxAccess    → /proc/<pid>/maps, /proc/<pid>/mem, libc geteuid
+```
+
+`Pointer` and `Memory` route all reads, writes, process lookup, and privilege checks through this interface, so the same call sites work on both platforms. The Windows-specific `ProcessUtil.getModule`, `Shell32Util`, `SignatureManager` and `SignatureUtil` remain available unchanged for existing Windows callers.
+
+---
+
 ## Quick start
 
 ```java
@@ -81,11 +98,12 @@ import it.adrian.code.memory.Pointer;
 public class Example {
     public static void main(String[] args) {
         // 1. Attach to the target process by executable name.
+        //    Windows: "notepad.exe"; Linux: the binary name as in /proc/<pid>/comm (e.g. "firefox").
         Pointer base = Pointer.getBaseAddress("notepad.exe");
 
         // 2. Read an int 0x1234 bytes past the module base.
         int value = Memory.readMemory(base, 0x1234L, Integer.class);
-        System.out.println("Value at notepad.exe+0x1234 = " + value);
+        System.out.println("Value at +0x1234 = " + value);
 
         // 3. Write a new int back to the same location.
         Memory.writeMemory(base, 0x1234L, 42, Integer.class);
@@ -93,7 +111,7 @@ public class Example {
 }
 ```
 
-> **Run this with Administrator privileges.** Without them the library shows a `MessageBox` and calls `System.exit(-1)`.
+> **Privileges required.** On Windows the library aborts via `MessageBox` and `System.exit(-1)` without Administrator rights. On Linux it prints to stderr and exits unless `euid == 0` or the JVM has `CAP_SYS_PTRACE`.
 
 ---
 
@@ -101,13 +119,18 @@ public class Example {
 
 ### Attaching to a process
 
-`Pointer.getBaseAddress(processName)` opens a handle with `PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION` (`0x0010 | 0x0020 | 0x0008`) and resolves the base address of the main module that matches `processName`:
+`Pointer.getBaseAddress(processName)` resolves the PID and the main module's base address for the named target. The mechanism is platform-specific:
+
+- **Windows:** opens a handle via `OpenProcess` with `PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION` (`0x0010 | 0x0020 | 0x0008`) and locates the module through `CreateToolhelp32Snapshot` + `Module32First/NextW`. Match is against `MODULEENTRY32W.szModule` (e.g. `"game.exe"`).
+- **Linux:** scans `/proc/*/comm` and the `/proc/*/exe` symlink basename to find the PID, then opens `/proc/<pid>/mem` for r/w. The module base is the lowest start address in `/proc/<pid>/maps` whose pathname basename equals the given name (or whose full path matches it).
 
 ```java
-Pointer base = Pointer.getBaseAddress("game.exe");
+Pointer base = Pointer.getBaseAddress("game.exe"); // Windows
+// or
+Pointer base = Pointer.getBaseAddress("game");     // Linux binary name
 ```
 
-If the process cannot be found the library opens a `MessageBox` and exits. The returned `Pointer` carries an internal `offset` initialised to `0`.
+If the process cannot be found the library aborts (MessageBox on Windows, stderr on Linux) and calls `System.exit(-1)`. The returned `Pointer` carries an internal `offset` initialised to `0`.
 
 ### Reading and writing typed values
 
@@ -155,6 +178,8 @@ int hp = Memory.readMemory(p, 0L, Integer.class);
 
 ### Signature (AOB) scanning
 
+> ⚠️ **Windows-only.** `SignatureManager` and `SignatureUtil` are coupled to `WinNT.HANDLE`/`Kernel32.ReadProcessMemory`. The cross-platform `Pointer`/`Memory` APIs above work on Linux; AOB scanning currently does not.
+
 When offsets shift between builds, byte signatures are more stable. `SignatureManager` scans the target module's address range for a pattern and returns the relative offset of the matched address:
 
 ```java
@@ -184,12 +209,16 @@ The mask uses `'x'` for "must match exactly" and any other character (typically 
 
 ### Utilities
 
-| Class / method                                  | Purpose                                                                 |
-|-------------------------------------------------|-------------------------------------------------------------------------|
-| `ProcessUtil.getProcessPidByName(String)`       | Returns the PID of the first process whose `szExeFile` equals the name. |
-| `ProcessUtil.getModule(int pid, String name)`   | Returns the `MODULEENTRY32W` for the named module (case-insensitive).   |
-| `Shell32Util.isUserWindowsAdmin()`              | Returns `true` if the current process has Administrator rights.         |
-| `Pointer.getModuleBaseAddress(int pid, String)` | Static helper used internally; resolves a module base via Tool Help.    |
+| Class / method                                  | Platform | Purpose                                                                 |
+|-------------------------------------------------|----------|-------------------------------------------------------------------------|
+| `NativeAccess.get()`                            | both     | Returns the platform-specific backend (`WindowsAccess` or `LinuxAccess`). |
+| `NativeAccess.findPidByName(String)`            | both     | First PID whose executable name matches.                                |
+| `NativeAccess.getModuleBaseAddress(pid, name)`  | both     | Base address of a loaded module / mapped binary.                        |
+| `NativeAccess.getModuleSize(pid, name)`         | both     | Mapped size of the module (max end − min start across mappings on Linux). |
+| `NativeAccess.isPrivileged()`                   | both     | Admin on Windows, `euid == 0` on Linux.                                 |
+| `ProcessUtil.getProcessPidByName(String)`       | both     | Thin wrapper around `NativeAccess.findPidByName`.                       |
+| `ProcessUtil.getModule(int pid, String name)`   | Windows  | Returns the `MODULEENTRY32W` for the named module (case-insensitive). Throws on Linux. |
+| `Shell32Util.isUserWindowsAdmin()`              | Windows  | Returns `true` if the current process has Administrator rights; `false` on Linux. |
 
 ---
 
@@ -243,11 +272,12 @@ The read/write primitives map to fixed-width writes/reads in the target process,
 
 ## Limitations & caveats
 
-- **Windows-only.** The library directly imports `kernel32`/`user32`/`shell32`. There is no Linux/macOS fallback.
+- **macOS is not supported.** Only Windows and Linux backends ship. The factory throws `UnsupportedOperationException` on other platforms.
 - **Bitness must match.** A 32-bit JVM cannot operate on a 64-bit target (or vice versa). Use the appropriate JDK distribution.
-- **No anti-cheat / kernel bypass.** Memory access is performed through the standard documented Win32 API. Targets protected by anti-tamper drivers or Protected Process Light (PPL) will reject `OpenProcess` with `ERROR_ACCESS_DENIED`.
-- **Process attachment is by executable name only.** If two processes share the same `szExeFile`, the first match wins.
+- **No anti-cheat / kernel bypass.** Memory access goes through documented OS APIs. On Windows, targets protected by anti-tamper drivers or Protected Process Light (PPL) reject `OpenProcess` with `ERROR_ACCESS_DENIED`. On Linux, processes marked non-dumpable or owned by another user with no `CAP_SYS_PTRACE` cannot be opened.
+- **Process attachment is by executable name only.** If two processes share the same name, the first match wins.
 - **`indirect64()` assumes a 64-bit pointer.** There is no `indirect32()` variant; on 32-bit targets you would need to extend the API.
+- **AOB scanning is Windows-only.** `SignatureManager` / `SignatureUtil` use `WinNT.HANDLE` directly. A cross-platform implementation on top of `NativeAccess` is on the roadmap.
 - **The library calls `System.exit(-1)`** on missing privileges or missing process. This is intentional for the typical "trainer" use case but may be inconvenient when embedding Mem4J inside a larger application.
 
 ---

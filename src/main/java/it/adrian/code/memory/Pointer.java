@@ -1,71 +1,60 @@
 package it.adrian.code.memory;
 
 import com.sun.jna.Memory;
-import com.sun.jna.platform.win32.Tlhelp32;
-import com.sun.jna.platform.win32.WinDef;
 import com.sun.jna.platform.win32.WinNT;
-import com.sun.jna.ptr.IntByReference;
-import it.adrian.code.interfaces.Kernel32;
-import it.adrian.code.interfaces.User32;
+import it.adrian.code.platform.NativeAccess;
+import it.adrian.code.platform.ProcessSession;
+import it.adrian.code.platform.windows.WindowsProcessSession;
 
-import java.util.Optional;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 public class Pointer {
 
-    private final WinNT.HANDLE handle;
+    private final ProcessSession session;
     public String processName;
     public String moduleName;
-    private com.sun.jna.Pointer baseAddress;
+    private long baseAddress;
     private long offset;
 
-    public Pointer(WinNT.HANDLE handle, com.sun.jna.Pointer baseAddress) {
-        this.handle = handle;
+    public Pointer(ProcessSession session, long baseAddress) {
+        this.session = session;
         this.baseAddress = baseAddress;
         this.offset = 0L;
     }
 
+    /**
+     * Backward-compatible constructor for Windows callers that already have a
+     * {@code WinNT.HANDLE} and a JNA pointer.
+     */
+    public Pointer(WinNT.HANDLE handle, com.sun.jna.Pointer baseAddress) {
+        this(new WindowsProcessSession(0, handle),
+                baseAddress == null ? 0L : com.sun.jna.Pointer.nativeValue(baseAddress));
+    }
+
     public static Pointer getBaseAddress(String processName) {
-        Optional<ProcessHandle> processHandle = ProcessHandle.allProcesses().filter(p -> p.info().command().orElse("").endsWith(processName)).findFirst();
-        Optional<Long> pidOptional = processHandle.map(ProcessHandle::pid);
-        int pid = 0;
-        if (pidOptional.isPresent()) {
-             pid = Math.toIntExact(pidOptional.get());
+        NativeAccess na = NativeAccess.get();
+        int pid = na.findPidByName(processName);
+        if (pid == 0) {
+            na.abortProcessNotFound(processName);
+            return null;
         }
-        else {
-            try {
-                User32.INSTANCE.MessageBox(null, "PROCESS TO ATTACH NOT FOUND", "Warning!?!", User32.MB_OK | User32.MB_ICONWARNING);
-                System.exit(-1);
-            } catch (Throwable e) {
-                //e.printStackTrace();
-            }
-        }
-        int accessRight = 0x0010 | 0x0020 | 0x0008;
-        WinNT.HANDLE handle = Kernel32.INSTANCE.OpenProcess(accessRight, false, pid);
-        com.sun.jna.Pointer baseAddress = getModuleBaseAddress(pid, processName);
-        Pointer ptr = new Pointer(handle, baseAddress);
+        ProcessSession session = na.openProcess(pid);
+        long base = na.getModuleBaseAddress(pid, processName);
+        Pointer ptr = new Pointer(session, base);
         ptr.processName = processName;
         ptr.moduleName = processName;
         return ptr;
     }
 
+    /**
+     * @deprecated Use {@link #getBaseAddress(String)}; this Windows-only helper
+     * is preserved for backward compatibility.
+     */
+    @Deprecated
     public static com.sun.jna.Pointer getModuleBaseAddress(int pid, String moduleName) {
-        com.sun.jna.Pointer baseAddress = null;
-        WinNT.HANDLE snapshot = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Tlhelp32.TH32CS_SNAPMODULE, new WinDef.DWORD(pid));
-        try {
-            Tlhelp32.MODULEENTRY32W module = new Tlhelp32.MODULEENTRY32W();
-            if (Kernel32.INSTANCE.Module32FirstW(snapshot, module)) {
-                do {
-                    if (moduleName.equals(module.szModule())) {
-                        baseAddress = module.modBaseAddr;
-                        break;
-                    }
-                } while (Kernel32.INSTANCE.Module32NextW(snapshot, module));
-            }
-        } finally {
-            Kernel32.INSTANCE.CloseHandle(snapshot);
-        }
-
-        return baseAddress;
+        long addr = NativeAccess.get().getModuleBaseAddress(pid, moduleName);
+        return addr == 0L ? null : new com.sun.jna.Pointer(addr);
     }
 
     public Pointer add(int val) {
@@ -74,69 +63,56 @@ public class Pointer {
     }
 
     public long readLong() {
-        Memory memory = getMemory(8);
-        return memory.getLong(0);
+        return ByteBuffer.wrap(read(8)).order(ByteOrder.LITTLE_ENDIAN).getLong();
     }
 
     public double readDouble() {
-        Memory memory = getMemory(8);
-        return memory.getDouble(0);
+        return ByteBuffer.wrap(read(8)).order(ByteOrder.LITTLE_ENDIAN).getDouble();
     }
 
-
     public float readFloat() {
-        Memory memory = getMemory(4);
-        return memory.getFloat(0);
+        return ByteBuffer.wrap(read(4)).order(ByteOrder.LITTLE_ENDIAN).getFloat();
     }
 
     public int readInt() {
-        Memory memory = getMemory(4);
-        return memory.getInt(0);
+        return ByteBuffer.wrap(read(4)).order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    private byte[] read(int length) {
+        byte[] buffer = new byte[length];
+        NativeAccess.get().readMemory(session, baseAddress + offset, buffer, length);
+        return buffer;
     }
 
     public Memory getMemory(int size) {
-        Memory memory = new Memory(size);
-        com.sun.jna.Pointer src = baseAddress.share(offset);
-        Kernel32.INSTANCE.ReadProcessMemory(handle, src, memory, size, null);
-        return memory;
+        byte[] buffer = read(size);
+        Memory mem = new Memory(size);
+        mem.write(0, buffer, 0, size);
+        return mem;
     }
 
     public boolean writeFloat(float value) {
-        Memory memory = new Memory(4);
-        memory.setFloat(0, value);
-        com.sun.jna.Pointer src = baseAddress.share(offset);
-        IntByReference intRef = new IntByReference();
-        return Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 4, intRef);
+        byte[] b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array();
+        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 4);
     }
 
     public boolean writeDouble(double value) {
-        Memory memory = new Memory(8);
-        memory.setDouble(0, value);
-        com.sun.jna.Pointer src = baseAddress.share(offset);
-        IntByReference intRef = new IntByReference();
-        return Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 8, intRef);
+        byte[] b = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putDouble(value).array();
+        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 8);
     }
 
     public boolean writeLong(long value) {
-        Memory memory = new Memory(8);
-        memory.setLong(0, value);
-        com.sun.jna.Pointer src = baseAddress.share(offset);
-        IntByReference intRef = new IntByReference();
-        boolean res = Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 8, intRef);
-        return res;
+        byte[] b = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array();
+        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 8);
     }
 
     public boolean writeInt(int value) {
-        Memory memory = new Memory(4);
-        memory.setInt(0, value);
-        com.sun.jna.Pointer src = baseAddress.share(offset);
-        IntByReference intRef = new IntByReference();
-        boolean res = Kernel32.INSTANCE.WriteProcessMemory(handle, src, memory, 4, intRef);
-        return res;
+        byte[] b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
+        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 4);
     }
 
     public Pointer copy() {
-        Pointer ptr = new Pointer(handle, baseAddress);
+        Pointer ptr = new Pointer(session, baseAddress);
         ptr.offset = offset;
         ptr.moduleName = moduleName;
         ptr.processName = processName;
@@ -144,13 +120,26 @@ public class Pointer {
     }
 
     public Pointer indirect64() {
-        baseAddress = new com.sun.jna.Pointer(readLong());
+        baseAddress = readLong();
         offset = 0;
         return this;
     }
 
+    public ProcessSession getSession() {
+        return session;
+    }
+
+    public long getBaseAddressValue() {
+        return baseAddress;
+    }
+
+    public long getOffset() {
+        return offset;
+    }
+
     @Override
     public String toString() {
-        return moduleName + "[" + String.format("%#08x", com.sun.jna.Pointer.nativeValue(baseAddress)) + "]+0x" + Long.toHexString(offset) + " => 0x" + Long.toHexString(com.sun.jna.Pointer.nativeValue(baseAddress) + offset);
+        return moduleName + "[" + String.format("%#08x", baseAddress) + "]+0x"
+                + Long.toHexString(offset) + " => 0x" + Long.toHexString(baseAddress + offset);
     }
 }

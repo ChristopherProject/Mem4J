@@ -5,10 +5,20 @@ import com.sun.jna.platform.win32.Tlhelp32;
 import com.sun.jna.platform.win32.WinDef;
 import com.sun.jna.platform.win32.WinNT;
 import it.adrian.code.interfaces.Kernel32;
+import it.adrian.code.platform.NativeAccess;
 
 public class ProcessUtil {
 
+    /**
+     * Returns the module entry (Windows-only) for the named module of the given pid.
+     * On Linux this throws {@link UnsupportedOperationException} — use
+     * {@link NativeAccess#getModuleBaseAddress(int, String)} / {@link NativeAccess#getModuleSize(int, String)} instead.
+     */
     public static Tlhelp32.MODULEENTRY32W getModule(int pid, String moduleName) {
+        if (!com.sun.jna.Platform.isWindows()) {
+            throw new UnsupportedOperationException(
+                    "ProcessUtil.getModule is Windows-only; use NativeAccess.get().getModuleBaseAddress/Size on Linux.");
+        }
         WinNT.HANDLE snapshotModules = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Kernel32.TH32CS_SNAPMODULE, new WinDef.DWORD(pid));
         WinNT.HANDLE snapshotModules32 = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Kernel32.TH32CS_SNAPMODULE32, new WinDef.DWORD(pid));
 
@@ -41,18 +51,6 @@ public class ProcessUtil {
     }
 
     public static int getProcessPidByName(String pName) {
-        Tlhelp32.PROCESSENTRY32.ByReference entry = new Tlhelp32.PROCESSENTRY32.ByReference();
-        WinNT.HANDLE snapshot = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Tlhelp32.TH32CS_SNAPALL, new WinDef.DWORD(0));
-        try {
-            while (Kernel32.INSTANCE.Process32NextW(snapshot, entry)) {
-                String processName = Native.toString(entry.szExeFile);
-                if (pName.equals(processName)) {
-                    return entry.th32ProcessID.intValue();
-                }
-            }
-        } finally {
-            Kernel32.INSTANCE.CloseHandle(snapshot);
-        }
-        return 0;
+        return NativeAccess.get().findPidByName(pName);
     }
 }
