@@ -58,7 +58,7 @@ Mem4J is published through [JitPack](https://jitpack.io), which builds artifacts
     <dependency>
         <groupId>com.github.christopherproject</groupId>
         <artifactId>Mem4J</artifactId>
-        <version>1.0.1</version>
+        <version>1.0.2</version>
     </dependency>
 </dependencies>
 ```
@@ -71,7 +71,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.christopherproject:Mem4J:1.0.1'
+    implementation 'com.github.christopherproject:Mem4J:1.0.2'
 }
 ```
 
