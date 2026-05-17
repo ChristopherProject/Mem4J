@@ -2,25 +2,58 @@ package it.adrian.code.memory;
 
 import com.sun.jna.Memory;
 import com.sun.jna.platform.win32.WinNT;
+import it.adrian.code.exceptions.MemoryAccessException;
+import it.adrian.code.exceptions.ModuleNotFoundException;
+import it.adrian.code.exceptions.ProcessNotFoundException;
+import it.adrian.code.platform.MemoryProtection;
 import it.adrian.code.platform.NativeAccess;
 import it.adrian.code.platform.ProcessSession;
 import it.adrian.code.platform.windows.WindowsProcessSession;
 
+import java.lang.ref.Cleaner;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 
-public class Pointer {
+public class Pointer implements AutoCloseable {
+
+    private static final Cleaner CLEANER = Cleaner.create();
 
     private final ProcessSession session;
+    private final Cleaner.Cleanable cleanable;
     public String processName;
     public String moduleName;
     private long baseAddress;
     private long offset;
+    private ByteOrder byteOrder = ByteOrder.LITTLE_ENDIAN;
+    private boolean forceWrite;
 
     public Pointer(ProcessSession session, long baseAddress) {
         this.session = session;
         this.baseAddress = baseAddress;
         this.offset = 0L;
+        this.cleanable = CLEANER.register(this, new SessionReleaser(session));
+    }
+
+    /**
+     * Cleaner action — releases the session's reference count when the
+     * {@code Pointer} becomes phantom-reachable without an explicit
+     * {@code close()}. Must NOT capture the enclosing {@code Pointer}.
+     */
+    private static final class SessionReleaser implements Runnable {
+        private final ProcessSession session;
+
+        SessionReleaser(ProcessSession session) {
+            this.session = session;
+        }
+
+        @Override
+        public void run() {
+            if (session.release() == 0) {
+                NativeAccess.get().closeSession(session);
+            }
+        }
     }
 
     /**
@@ -32,15 +65,41 @@ public class Pointer {
                 baseAddress == null ? 0L : com.sun.jna.Pointer.nativeValue(baseAddress));
     }
 
+    /**
+     * Attach to the named process and resolve the base address of its main module.
+     *
+     * @throws ProcessNotFoundException if no process matches the given name.
+     * @throws ModuleNotFoundException  if the process is found but its main module cannot be resolved.
+     */
     public static Pointer getBaseAddress(String processName) {
         NativeAccess na = NativeAccess.get();
         int pid = na.findPidByName(processName);
         if (pid == 0) {
-            na.abortProcessNotFound(processName);
-            return null;
+            throw new ProcessNotFoundException(processName);
         }
+        return attachByPid(na, processName, pid);
+    }
+
+    /**
+     * Attach to the process identified by {@code pid} and resolve the base address of
+     * the module / mapped binary whose name matches {@code processName}. Use this
+     * overload when several processes share the same executable name and you have
+     * already disambiguated the right PID (e.g. via {@link it.adrian.code.utilities.ProcessUtil#listModules(int)}
+     * or any external process inspector).
+     *
+     * @throws ModuleNotFoundException if the module cannot be located inside that PID.
+     */
+    public static Pointer getBaseAddress(String processName, int pid) {
+        return attachByPid(NativeAccess.get(), processName, pid);
+    }
+
+    private static Pointer attachByPid(NativeAccess na, String processName, int pid) {
         ProcessSession session = na.openProcess(pid);
         long base = na.getModuleBaseAddress(pid, processName);
+        if (base == 0L) {
+            na.closeSession(session);
+            throw new ModuleNotFoundException(processName);
+        }
         Pointer ptr = new Pointer(session, base);
         ptr.processName = processName;
         ptr.moduleName = processName;
@@ -57,30 +116,95 @@ public class Pointer {
         return addr == 0L ? null : new com.sun.jna.Pointer(addr);
     }
 
-    public Pointer add(int val) {
+    public Pointer withByteOrder(ByteOrder order) {
+        this.byteOrder = order;
+        return this;
+    }
+
+    public ByteOrder byteOrder() {
+        return byteOrder;
+    }
+
+    /**
+     * Returns a sibling {@code Pointer} whose writes go through the
+     * protect&rarr;write&rarr;restore dance, so they succeed even against
+     * read-only or executable pages (e.g. patching {@code .text}).
+     * <p>
+     * On Windows this temporarily flips the affected pages to
+     * {@code PAGE_EXECUTE_READWRITE} and restores their previous protection
+     * after the write. On Linux {@code /proc/<pid>/mem} already ignores
+     * page protection when the JVM has {@code CAP_SYS_PTRACE}, so this
+     * call is a no-op.
+     */
+    public Pointer force() {
+        Pointer p = copy();
+        p.forceWrite = true;
+        return p;
+    }
+
+    public Pointer add(long val) {
         offset += val;
         return this;
     }
 
+    public Pointer add(int val) {
+        return add((long) val);
+    }
+
     public long readLong() {
-        return ByteBuffer.wrap(read(8)).order(ByteOrder.LITTLE_ENDIAN).getLong();
+        return ByteBuffer.wrap(read(8)).order(byteOrder).getLong();
     }
 
     public double readDouble() {
-        return ByteBuffer.wrap(read(8)).order(ByteOrder.LITTLE_ENDIAN).getDouble();
+        return ByteBuffer.wrap(read(8)).order(byteOrder).getDouble();
     }
 
     public float readFloat() {
-        return ByteBuffer.wrap(read(4)).order(ByteOrder.LITTLE_ENDIAN).getFloat();
+        return ByteBuffer.wrap(read(4)).order(byteOrder).getFloat();
     }
 
     public int readInt() {
-        return ByteBuffer.wrap(read(4)).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        return ByteBuffer.wrap(read(4)).order(byteOrder).getInt();
+    }
+
+    public short readShort() {
+        return ByteBuffer.wrap(read(2)).order(byteOrder).getShort();
+    }
+
+    public byte readByte() {
+        return read(1)[0];
+    }
+
+    public byte[] readBytes(int length) {
+        return read(length);
+    }
+
+    /**
+     * Reads up to {@code maxBytes} bytes and decodes them as a string in the
+     * given charset, stopping at the first NUL terminator if any.
+     */
+    public String readString(int maxBytes, Charset charset) {
+        byte[] raw = read(maxBytes);
+        int end = raw.length;
+        for (int i = 0; i < raw.length; i++) {
+            if (raw[i] == 0) {
+                end = i;
+                break;
+            }
+        }
+        return new String(raw, 0, end, charset);
+    }
+
+    public String readString(int maxBytes) {
+        return readString(maxBytes, StandardCharsets.UTF_8);
     }
 
     private byte[] read(int length) {
         byte[] buffer = new byte[length];
-        NativeAccess.get().readMemory(session, baseAddress + offset, buffer, length);
+        if (!NativeAccess.get().readMemory(session, baseAddress + offset, buffer, length)) {
+            throw new MemoryAccessException(
+                    "Read of " + length + " bytes at 0x" + Long.toHexString(baseAddress + offset) + " failed");
+        }
         return buffer;
     }
 
@@ -92,35 +216,89 @@ public class Pointer {
     }
 
     public boolean writeFloat(float value) {
-        byte[] b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array();
-        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 4);
+        return write(ByteBuffer.allocate(4).order(byteOrder).putFloat(value).array());
     }
 
     public boolean writeDouble(double value) {
-        byte[] b = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putDouble(value).array();
-        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 8);
+        return write(ByteBuffer.allocate(8).order(byteOrder).putDouble(value).array());
     }
 
     public boolean writeLong(long value) {
-        byte[] b = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array();
-        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 8);
+        return write(ByteBuffer.allocate(8).order(byteOrder).putLong(value).array());
     }
 
     public boolean writeInt(int value) {
-        byte[] b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
-        return NativeAccess.get().writeMemory(session, baseAddress + offset, b, 4);
+        return write(ByteBuffer.allocate(4).order(byteOrder).putInt(value).array());
+    }
+
+    public boolean writeShort(short value) {
+        return write(ByteBuffer.allocate(2).order(byteOrder).putShort(value).array());
+    }
+
+    public boolean writeByte(byte value) {
+        return write(new byte[]{value});
+    }
+
+    public boolean writeBytes(byte[] data) {
+        return write(data);
+    }
+
+    public boolean writeString(String value, Charset charset) {
+        return write(value.getBytes(charset));
+    }
+
+    public boolean writeString(String value) {
+        return writeString(value, StandardCharsets.UTF_8);
+    }
+
+    private boolean write(byte[] data) {
+        NativeAccess na = NativeAccess.get();
+        long address = baseAddress + offset;
+        if (!forceWrite || !com.sun.jna.Platform.isWindows()) {
+            return na.writeMemory(session, address, data, data.length);
+        }
+        MemoryProtection original = na.queryProtection(session, address);
+        boolean flipped = na.protect(session, address, data.length, MemoryProtection.READ_WRITE_EXECUTE);
+        try {
+            return na.writeMemory(session, address, data, data.length);
+        } finally {
+            if (flipped && original != null) {
+                na.protect(session, address, data.length, original);
+            }
+        }
+    }
+
+    /**
+     * Change the protection of {@code size} bytes starting at the current address.
+     * <p>
+     * Windows-only — Linux throws {@link UnsupportedOperationException}.
+     */
+    public boolean protect(long size, MemoryProtection protection) {
+        return NativeAccess.get().protect(session, baseAddress + offset, size, protection);
     }
 
     public Pointer copy() {
-        Pointer ptr = new Pointer(session, baseAddress);
+        Pointer ptr = new Pointer(session.retain(), baseAddress);
         ptr.offset = offset;
         ptr.moduleName = moduleName;
         ptr.processName = processName;
+        ptr.byteOrder = byteOrder;
+        ptr.forceWrite = forceWrite;
         return ptr;
     }
 
     public Pointer indirect64() {
         baseAddress = readLong();
+        offset = 0;
+        return this;
+    }
+
+    /**
+     * Dereference a 32-bit pointer at the current address (useful when attached
+     * to a 32-bit target). The value is zero-extended to 64 bits.
+     */
+    public Pointer indirect32() {
+        baseAddress = ((long) readInt()) & 0xFFFFFFFFL;
         offset = 0;
         return this;
     }
@@ -135,6 +313,23 @@ public class Pointer {
 
     public long getOffset() {
         return offset;
+    }
+
+    /**
+     * Decrement the session's reference count. When this {@code Pointer} is the
+     * last live view onto the underlying handle, the OS resource is released
+     * ({@code CloseHandle} on Windows, {@code /proc/<pid>/mem} fd closed on
+     * Linux). Calling {@code close()} on a copy is therefore safe even if other
+     * sibling {@code Pointer}s are still in use — they will keep working until
+     * the last one is closed.
+     * <p>
+     * The method is idempotent: subsequent calls are no-ops. If the
+     * {@code Pointer} becomes garbage without an explicit {@code close()},
+     * a {@link Cleaner} performs the same release on a background thread.
+     */
+    @Override
+    public void close() {
+        cleanable.clean();
     }
 
     @Override

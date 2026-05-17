@@ -16,8 +16,12 @@ on:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    name: Build on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
 
     permissions:
       contents: write
@@ -33,6 +37,8 @@ jobs:
     - name: Build with Maven
       run: mvn -B package --file pom.xml
 
-    # Optional: Uploads the full dependency graph to GitHub to improve the quality of Dependabot alerts this repository can receive
+    # Optional: Uploads the full dependency graph to GitHub to improve the quality of Dependabot alerts this repository can receive.
+    # Runs only on Linux to avoid duplicate submissions across matrix legs.
     - name: Update dependency graph
+      if: matrix.os == 'ubuntu-latest' && github.event_name == 'push'
       uses: advanced-security/maven-dependency-submission-action@v4
