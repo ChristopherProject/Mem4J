@@ -19,7 +19,7 @@ It runs on **both Windows and Linux** behind the same `Pointer` / `Memory` API. 
 - **Pointer chains** — dereference 64-bit *and* 32-bit pointers, chain offsets fluently with `copy()`, `add()`, `indirect64()`, `indirect32()`.
 - **Signature (AOB) scanning** — locate an address inside the target's memory using a byte pattern + mask (`"xx?xx??x"`). **Cross-platform**: same API on Windows and Linux.
 - **Write into protected memory** — `Pointer.force()` returns a sibling pointer whose writes flip the affected pages to writable, perform the write, then restore the original protection. Works for read-only and executable mappings (e.g. patching `.text`).
-- **Memory protection & allocation** *(Windows)* — wrappers for `VirtualProtectEx`, `VirtualAllocEx`, `VirtualFreeEx`, `VirtualQueryEx`. `queryProtection` is also supported on Linux via `/proc/<pid>/maps`; the other three throw `UnsupportedOperationException` on Linux.
+- **Memory protection & allocation** — wrappers for `VirtualProtectEx`, `VirtualAllocEx`, `VirtualFreeEx`, `VirtualQueryEx` on Windows (production-ready). On **Linux x86_64** the same operations are emulated by injecting an `mprotect`/`mmap`/`munmap` syscall into the target via `ptrace` — **experimental**; see the [dedicated section](#memory-protection-and-allocation) for caveats. `queryProtection` works reliably on both backends without injection (reads `/proc/<pid>/maps` on Linux).
 - **Embedding-friendly error handling** — every failure raises an exception from the `Mem4JException` hierarchy. No more `System.exit(-1)` or `MessageBox` pop-ups.
 
 ---
@@ -166,6 +166,17 @@ so the OS handle is always released when you leave the block.
 
 If no process matches, `ProcessNotFoundException` is thrown. If the process is found but its main module is not visible (e.g. the JVM lacks permission to read its mappings), `ModuleNotFoundException` is thrown.
 
+When several processes share the same executable name, attach by PID directly:
+
+```java
+int pid = pickRightInstance(); // your own disambiguation logic
+try (Pointer base = Pointer.getBaseAddress("game.exe", pid)) {
+    // …
+}
+```
+
+The single-argument overload (name only) is preserved for the common single-instance case and resolves the PID via the OS process list.
+
 ### Reading and writing typed values
 
 `Memory.readMemory` / `Memory.writeMemory` are the high-level entry points. They take a base `Pointer`, an offset in bytes, and the target type:
@@ -263,7 +274,7 @@ base.copy().add(0x1234).force().writeBytes(nopSled);
 //          so force() is a no-op.
 ```
 
-### Memory protection and allocation *(Windows-only)*
+### Memory protection and allocation
 
 ```java
 NativeAccess na = NativeAccess.get();
@@ -271,7 +282,7 @@ NativeAccess na = NativeAccess.get();
 // Make 4 KiB at base+0x1000 writable+executable for a hook.
 base.copy().add(0x1000).protect(0x1000, MemoryProtection.READ_WRITE_EXECUTE);
 
-// Query the current protection of any address (this one is cross-platform).
+// Query the current protection of any address.
 MemoryProtection prot = na.queryProtection(base.getSession(), base.getBaseAddressValue() + 0x2000);
 
 // Allocate a remote 4 KiB block for a code cave.
@@ -281,19 +292,27 @@ na.writeMemory(base.getSession(), cave, shellcode, shellcode.length);
 na.free(base.getSession(), cave, 0);
 ```
 
-On Linux `protect`, `allocate` and `free` throw `UnsupportedOperationException` — remote `mprotect` / `mmap` would require injecting a syscall via `ptrace`, which is outside this library's scope. `queryProtection` is supported on Linux via `/proc/<pid>/maps`.
+Implementation:
+
+- **Windows:** thin wrappers over `VirtualProtectEx`, `VirtualAllocEx`, `VirtualFreeEx`, `VirtualQueryEx`. Production-ready.
+- **Linux x86_64 — *experimental*:** `protect` / `allocate` / `free` are implemented by **ptrace syscall injection**: the library `PTRACE_ATTACH`es the target, saves its registers and the instruction bytes at the current `RIP`, patches in `syscall; int3`, sets up `RAX` and the SysV ABI registers for `mprotect(2)` / `mmap(2)` / `munmap(2)`, runs to the breakpoint, reads the return value out of `RAX`, restores everything and detaches. The end-to-end round-trip is **not yet covered by automated tests** (the integration test is marked `@Disabled` because the injection helper is currently sensitive to the CPU state the target is in when `PTRACE_ATTACH` stops it — e.g. nested in an interrupted `nanosleep` — and can deadlock waiting for the `int3` trap). Treat this code path as experimental until a hardened version lands. `queryProtection` does **not** need injection and works reliably.
+- **Other Linux architectures (ARM64, etc.):** `protect` / `allocate` / `free` throw `UnsupportedOperationException`. Pull requests welcome.
+
+> ⚠️ ptrace injection requires `CAP_SYS_PTRACE` (or root) and the same Yama `ptrace_scope` constraints already documented in [Platform notes — Linux](#linux-notes).
 
 ### Utilities
 
 | Class / method                                  | Platform | Purpose                                                                                                                |
 |-------------------------------------------------|----------|------------------------------------------------------------------------------------------------------------------------|
 | `NativeAccess.get()`                            | both     | Returns the platform-specific backend (`WindowsAccess` or `LinuxAccess`).                                              |
+| `Pointer.getBaseAddress(String)`                | both     | Attach by executable name; first match wins (`ProcessNotFoundException` on miss).                                      |
+| `Pointer.getBaseAddress(String, int pid)`       | both     | Attach by name + explicit PID; skips process-list lookup. Use it when multiple processes share the same executable name. |
 | `NativeAccess.findPidByName(String)`            | both     | First PID whose executable name matches.                                                                               |
 | `NativeAccess.getModuleBaseAddress(pid, name)`  | both     | Base address of a loaded module / mapped binary.                                                                       |
 | `NativeAccess.getModuleSize(pid, name)`         | both     | Mapped size of the module (max end − min start across mappings on Linux).                                              |
 | `NativeAccess.listModules(int pid)`             | both     | Every loaded module / mapped binary as `List<ModuleInfo>`.                                                             |
 | `NativeAccess.queryProtection(session, addr)`   | both     | Current page protection at the address; reads `/proc/<pid>/maps` on Linux.                                             |
-| `NativeAccess.protect / allocate / free`        | Windows  | `VirtualProtectEx` / `VirtualAllocEx` / `VirtualFreeEx`. Throws `UnsupportedOperationException` on Linux.              |
+| `NativeAccess.protect / allocate / free`        | both     | `VirtualProtectEx` / `VirtualAllocEx` / `VirtualFreeEx` on Windows; `mprotect(2)` / `mmap(2)` / `munmap(2)` injected via `ptrace` on Linux x86_64. |
 | `NativeAccess.isPrivileged()`                   | both     | Admin on Windows, `euid == 0` on Linux.                                                                                |
 | `Pointer.force()`                               | both     | Returns a sibling pointer that flips protection around its writes (no-op on Linux).                                    |
 | `ProcessUtil.getProcessPidByName(String)`       | both     | Thin wrapper around `NativeAccess.findPidByName`.                                                                      |
@@ -365,6 +384,7 @@ Memory
 
 Pointer (implements AutoCloseable)
   static Pointer  getBaseAddress(String processName)
+  static Pointer  getBaseAddress(String processName, int pid)   // disambiguate by PID
   Pointer         copy()
   Pointer         add(long bytes)
   Pointer         indirect64()
@@ -387,9 +407,9 @@ NativeAccess
   ProcessSession       openProcess(int pid)
   boolean              readMemory / writeMemory(session, address, byte[], length)
   MemoryProtection     queryProtection(session, address)
-  boolean              protect(session, address, size, MemoryProtection)  // Windows
-  long                 allocate(session, size, MemoryProtection)          // Windows
-  boolean              free(session, address, size)                       // Windows
+  boolean              protect(session, address, size, MemoryProtection)   // ptrace inject on Linux
+  long                 allocate(session, size, MemoryProtection)            // ptrace inject on Linux
+  boolean              free(session, address, size)                         // ptrace inject on Linux
   void                 closeSession(ProcessSession)
   boolean              isPrivileged()
   void                 ensurePrivileged()                                 // throws PrivilegeException
@@ -436,9 +456,8 @@ The read/write primitives map to fixed-width writes/reads in the target process,
 - **macOS is not supported.** Only Windows and Linux backends ship. The factory throws `UnsupportedOperationException` on other platforms.
 - **Bitness must match.** A 32-bit JVM cannot operate on a 64-bit target (or vice versa). Use the appropriate JDK distribution.
 - **No anti-cheat / kernel bypass.** Memory access goes through documented OS APIs. On Windows, anti-tamper drivers and PPL reject `OpenProcess` with `ERROR_ACCESS_DENIED`. On Linux, processes marked non-dumpable or owned by another user without `CAP_SYS_PTRACE` cannot be opened.
-- **Process attachment is by executable name only.** If two processes share the same name, the first match wins.
-- **Memory protection and remote allocation are Windows-only.** Implementing them on Linux requires injecting a syscall via `ptrace`, which is out of scope.
-- **No test suite yet.** Validation is done via local smoke programs against `/proc/self/mem`. Coverage is planned as a follow-up.
+- **Process attachment defaults to executable name.** If two processes share the same name, the first match wins — use the `Pointer.getBaseAddress(name, pid)` overload to disambiguate by PID.
+- **Remote memory protection and allocation on non-x86_64 Linux are not implemented.** On Windows and on Linux x86_64 they work as documented; on other Linux architectures (ARM64, RISC-V, …) `protect` / `allocate` / `free` throw `UnsupportedOperationException` because the ptrace syscall-injection helper has not been ported there. `queryProtection` works regardless of architecture.
 
 ---
 
@@ -451,6 +470,33 @@ mvn -B package
 ```
 
 Artifacts land in `target/`: the runtime jar, a sources jar and a Javadoc jar (the last two so IDEs of downstream consumers can show docs and step into Mem4J sources). CI runs the same `mvn -B package` on both `ubuntu-latest` and `windows-latest` for every push and pull request targeting `master` (see [`.github/workflows/maven.yml`](.github/workflows/maven.yml)).
+
+---
+
+## Testing
+
+Mem4J ships a JUnit 5 integration test suite under `src/test/java/it/adrian/code/Mem4JTests.java`. Tests exercise the active backend against the running JVM (and a short-lived `sleep` child for the ptrace injection round-trip) — there is no mock layer, every assertion is end-to-end against real kernel memory.
+
+```bash
+mvn -B test
+```
+
+The suite is privilege-aware:
+
+- Tests that need `/proc/<pid>/mem` or ptrace use JUnit's `Assumptions.assumeTrue` to **skip cleanly** when the JVM is not privileged. They never `fail` on an unprivileged machine.
+- Windows-specific tests are gated with `@EnabledOnOs(OS.WINDOWS)`; Linux-specific tests with `@EnabledOnOs(OS.LINUX)`.
+- The ptrace injection test additionally skips on non-x86_64 Linux.
+
+For local development on Linux:
+
+```bash
+sudo mvn -B test                       # runs everything, including the ptrace round-trip
+# or, without sudo, after granting CAP_SYS_PTRACE to the JVM once
+sudo setcap cap_sys_ptrace+ep "$(realpath "$(which java)")"
+mvn -B test
+```
+
+CI runs `mvn -B test` on both `ubuntu-latest` and `windows-latest`, so the matrix exercises whichever backend matches the runner.
 
 ---
 
