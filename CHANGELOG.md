@@ -6,6 +6,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+- `ProcessSession` is now reference-counted. `Pointer.copy()` retains a new
+  reference, `Pointer.close()` releases one. The underlying OS handle is only
+  torn down when the **last** live `Pointer` is closed, removing the
+  previous footgun where closing a copy made every sibling pointer
+  unusable. A `java.lang.ref.Cleaner` registered on each `Pointer`
+  releases the same reference on GC, so forgetting `close()` no longer
+  leaks the handle.
+- AOB scanning (`SignatureUtil.findSignature`) now consults
+  `NativeAccess.queryProtection` before each 64 KiB read. Unreadable
+  regions (`MemoryProtection.NONE`) are skipped *explicitly* instead of
+  surfacing as silent `readMemory` failures, which makes the scan path
+  honest about what it skipped.
+
 ### Added
 - `it.adrian.code.platform.NativeAccess` cross-platform layer that selects
   the right backend (`WindowsAccess` or `LinuxAccess`) at runtime via

@@ -236,16 +236,16 @@ Pointer p = base.copy()
 int hp = Memory.readMemory(p, 0L, Integer.class);
 ```
 
-| Method            | Effect                                                                                                         |
-|-------------------|----------------------------------------------------------------------------------------------------------------|
-| `copy()`          | Returns a new `Pointer` sharing handle, base, offset and byte order. Use this before mutating the original.   |
-| `add(long)`       | Adds bytes to the current offset and returns `this` (mutable, fluent). Accepts the full `long` range.         |
-| `indirect64()`    | Reads a 64-bit pointer at the current address, replaces the base with that value, and resets the offset to 0. |
-| `indirect32()`    | Same as `indirect64()` but reads a zero-extended 32-bit pointer — use against 32-bit targets.                 |
-| `withByteOrder()` | Switch this pointer's endianness for subsequent reads/writes.                                                  |
-| `force()`         | Returns a sibling whose writes bypass page protection (see below).                                             |
-| `close()`         | Release the underlying OS handle / file descriptor.                                                            |
-| `toString()`      | Pretty-prints as `module[0xBASE]+0xOFFSET => 0xFINAL`.                                                         |
+| Method            | Effect                                                                                                                                 |
+|-------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `copy()`          | Returns a new `Pointer` sharing handle, base, offset and byte order. Bumps the session reference count so `close()` on any sibling is safe. |
+| `add(long)`       | Adds bytes to the current offset and returns `this` (mutable, fluent). Accepts the full `long` range.                                  |
+| `indirect64()`    | Reads a 64-bit pointer at the current address, replaces the base with that value, and resets the offset to 0.                          |
+| `indirect32()`    | Same as `indirect64()` but reads a zero-extended 32-bit pointer — use against 32-bit targets.                                          |
+| `withByteOrder()` | Switch this pointer's endianness for subsequent reads/writes.                                                                          |
+| `force()`         | Returns a sibling whose writes bypass page protection (see below).                                                                     |
+| `close()`         | Decrement the session refcount; the OS handle / fd is released when the last live `Pointer` is closed. Idempotent.                     |
+| `toString()`      | Pretty-prints as `module[0xBASE]+0xOFFSET => 0xFINAL`.                                                                                 |
 
 ### Signature (AOB) scanning
 
@@ -301,6 +301,35 @@ Implementation:
 - **Other Linux architectures (ARM64, etc.):** `protect` / `allocate` / `free` throw `UnsupportedOperationException`. Pull requests welcome.
 
 > ⚠️ ptrace injection requires `CAP_SYS_PTRACE` (or root) and the same Yama `ptrace_scope` constraints already documented in [Platform notes — Linux](#linux-notes).
+
+### Concurrency and lifecycle
+
+`Pointer` is reference-counted. Every `copy()` retains a new reference on the underlying `ProcessSession`; every `close()` releases one. The OS handle (Windows) or `/proc/<pid>/mem` file descriptor (Linux) is only torn down when the **last** live `Pointer` is closed, so it is safe to:
+
+- Hand out copies to multiple worker threads.
+- Close the original or any copy in any order.
+- Let copies go out of scope without an explicit `close()` — a `Cleaner` decrements the refcount when the `Pointer` becomes phantom-reachable, eventually releasing the OS handle.
+
+The recommended multi-threaded pattern is one root `Pointer` per attach, with each worker thread taking a private `copy()` to drive its own offset / `force()` / byte-order state without interfering with the others:
+
+```java
+try (Pointer root = Pointer.getBaseAddress("game.exe")) {
+    ExecutorService pool = Executors.newFixedThreadPool(4);
+    for (int slot = 0; slot < 4; slot++) {
+        final int s = slot;
+        pool.submit(() -> {
+            try (Pointer view = root.copy()) {
+                int hp = Memory.readMemory(view, slot(s).hpOffset(), Integer.class);
+                // ...
+            }
+        });
+    }
+    pool.shutdown();
+    pool.awaitTermination(1, TimeUnit.MINUTES);
+}
+```
+
+The mutating fluent methods (`add`, `indirect64`, `indirect32`, `withByteOrder`, `force`) all operate on a *single* `Pointer` instance — don't share that instance across threads, give each thread its own copy.
 
 ### Utilities
 
@@ -466,13 +495,8 @@ The read/write primitives map to fixed-width writes/reads in the target process,
 
 ## Limitations & caveats
 
-- **macOS is not supported.** Only Windows and Linux backends ship. `NativeAccess.get()` throws `UnsupportedOperationException` on other platforms.
-- **Bitness must match.** A 32-bit JVM cannot operate on a 64-bit target (or vice versa). Use the appropriate JDK distribution.
-- **No anti-cheat / kernel bypass.** Memory access goes through documented OS APIs. On Windows, anti-tamper drivers and Protected Process Light (PPL) reject `OpenProcess` with `ERROR_ACCESS_DENIED`. On Linux, processes marked non-dumpable or owned by another user without `CAP_SYS_PTRACE` cannot be opened.
-- **`Pointer` shares its session across copies.** `copy()` produces a new `Pointer` that points at the same underlying handle / file descriptor as the original. Calling `close()` on any one of them closes the session for **all** sibling pointers — design around a single "root" `Pointer` whose lifetime spans every read/write, and copy freely from it inside a try-with-resources block.
-- **`Pointer` is not thread-safe.** `add()`, `indirect64()`, `withByteOrder()` and the `force()` flag mutate the receiver. Per-thread `copy()` is cheap; share copies, not the originals.
-- **AOB scanning reads in 64 KiB chunks.** Unmapped or unreadable pages inside the scan range are skipped silently — a match in such a region cannot be found. Use `queryProtection` if you need to assert the range is fully resident first.
-- **No anti-debug / stealth.** Targets that watch for ptrace, anomalous `OpenProcess` calls, or unexpected handle counts can detect Mem4J. The library does not try to hide.
+- **macOS is not yet supported.** Only Windows and Linux backends ship; the abstraction layer was designed to accept a third backend without source-level changes (`NativeAccess.get()` already inspects `com.sun.jna.Platform`). A Mach-backed `MacOSAccess` (using `task_for_pid` + `mach_vm_read_overwrite` / `mach_vm_protect` / `mach_vm_allocate`) is on the roadmap and welcomes contributors with access to macOS hardware — implementing it speculatively without a real Mac to test against would ship code that almost certainly misbehaves on real systems.
+- **No anti-cheat / kernel bypass.** Memory access goes through documented OS APIs. On Windows, anti-tamper drivers and Protected Process Light (PPL) reject `OpenProcess` with `ERROR_ACCESS_DENIED`. On Linux, processes marked non-dumpable or owned by another user without `CAP_SYS_PTRACE` cannot be opened. Mem4J also does not attempt to hide its own debugger-like activity (ptrace traces, handle counts, etc.) — targets that actively look for that pattern can detect it.
 
 ---
 
