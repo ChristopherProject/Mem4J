@@ -11,12 +11,16 @@ It runs on **both Windows and Linux** behind the same `Pointer` / `Memory` API. 
 
 ## Features
 
-- **Process attachment** — open a handle to a target process by its executable name (`Pointer.getBaseAddress(String)`).
-- **Module base resolution** — locate the in-memory base address of a loaded module (PE image) via Tool Help snapshots.
-- **Typed read/write** — read and write `int`, `long`, `float`, and `double` directly at an absolute or offset-based address.
-- **Pointer chains** — dereference 64-bit pointers and chain offsets (`copy()`, `add()`, `indirect64()`) to follow multi-level pointer paths typical of game/engine internals.
-- **Signature (AOB) scanning** — locate an address inside the target's memory using a byte pattern + mask, e.g. `"xx?xx??x"`.
-- **Privilege check** — refuses to operate unless the JVM is running with Administrator rights, surfacing a `MessageBox` warning instead of silently failing.
+- **Process attachment** — open a handle to a target process by its executable name (`Pointer.getBaseAddress(String)`). `Pointer` implements `AutoCloseable`, so the handle / file descriptor is released on `close()`.
+- **Module base resolution** — locate the in-memory base address of a loaded module / mapped binary.
+- **Module enumeration** — `ProcessUtil.listModules(pid)` returns every loaded module with name, full path, base address and size (cross-platform).
+- **Typed read/write** — read and write `byte`, `short`, `int`, `long`, `float`, and `double` directly at an absolute or offset-based address. Endianness is configurable per `Pointer` via `withByteOrder(ByteOrder)`.
+- **Bulk I/O & strings** — `readBytes` / `writeBytes` for raw buffers; `readString` / `writeString` for NUL-terminated or fixed-length strings (any `Charset`).
+- **Pointer chains** — dereference 64-bit *and* 32-bit pointers, chain offsets (`copy()`, `add()`, `indirect64()`, `indirect32()`) to follow multi-level pointer paths typical of game/engine internals.
+- **Signature (AOB) scanning** — locate an address inside the target's memory using a byte pattern + mask, e.g. `"xx?xx??x"`. Works on both Windows and Linux.
+- **Memory protection & allocation** — wrap `VirtualProtectEx`, `VirtualAllocEx`, `VirtualFreeEx`, `VirtualQueryEx` for code caves and page-permission tricks on Windows. On Linux `queryProtection` is supported via `/proc/<pid>/maps`; `protect`/`allocate`/`free` would require syscall injection and throw `UnsupportedOperationException`.
+- **Write to protected pages** — `Pointer.force()` returns a sibling pointer whose writes flip the page to writable, perform the write, then restore the original protection. Works for read-only and executable mappings (e.g. patching `.text`).
+- **Privilege check** — refuses to operate unless the JVM is privileged, throwing a `PrivilegeException` (no more `System.exit`).
 
 ---
 
@@ -27,7 +31,7 @@ It runs on **both Windows and Linux** behind the same `Pointer` / `Memory` API. 
 | Java              | **11 or higher** (uses `ProcessHandle`, available since Java 9; project targets Java 11) |
 | Operating system  | **Windows** (`kernel32.dll`, `user32.dll`, `shell32.dll`) **or Linux** (`/proc/<pid>/{maps,mem,comm,exe}` + `libc` for `geteuid`) |
 | Architecture      | The JVM bitness **must match** the target process. A 32-bit JVM cannot read/write a 64-bit process and vice versa. Use a 64-bit JDK against 64-bit targets. |
-| Privileges        | **Windows:** Administrator (checked via `Shell32.IsUserAnAdmin`). **Linux:** `euid == 0` (root) or the JVM granted `CAP_SYS_PTRACE`. The library aborts otherwise. |
+| Privileges        | **Windows:** Administrator (checked via `Shell32.IsUserAnAdmin`). **Linux:** `euid == 0` (root) or the JVM granted `CAP_SYS_PTRACE`. The library throws `PrivilegeException` otherwise. |
 | Runtime deps      | `net.java.dev.jna:jna:5.12.1`, `net.java.dev.jna:jna-platform:5.12.1` |
 
 ---
@@ -97,21 +101,23 @@ import it.adrian.code.memory.Pointer;
 
 public class Example {
     public static void main(String[] args) {
-        // 1. Attach to the target process by executable name.
-        //    Windows: "notepad.exe"; Linux: the binary name as in /proc/<pid>/comm (e.g. "firefox").
-        Pointer base = Pointer.getBaseAddress("notepad.exe");
+        // Attach to the target process by executable name.
+        // Windows: "notepad.exe"; Linux: the binary name as in /proc/<pid>/comm (e.g. "firefox").
+        // try-with-resources releases the OS handle / fd on exit.
+        try (Pointer base = Pointer.getBaseAddress("notepad.exe")) {
 
-        // 2. Read an int 0x1234 bytes past the module base.
-        int value = Memory.readMemory(base, 0x1234L, Integer.class);
-        System.out.println("Value at +0x1234 = " + value);
+            // Read an int 0x1234 bytes past the module base.
+            int value = Memory.readMemory(base, 0x1234L, Integer.class);
+            System.out.println("Value at +0x1234 = " + value);
 
-        // 3. Write a new int back to the same location.
-        Memory.writeMemory(base, 0x1234L, 42, Integer.class);
+            // Write a new int back to the same location.
+            Memory.writeMemory(base, 0x1234L, 42, Integer.class);
+        }
     }
 }
 ```
 
-> **Privileges required.** On Windows the library aborts via `MessageBox` and `System.exit(-1)` without Administrator rights. On Linux it prints to stderr and exits unless `euid == 0` or the JVM has `CAP_SYS_PTRACE`.
+> **Privileges required.** On Windows the library throws `PrivilegeException` without Administrator rights. On Linux it does the same unless `euid == 0` or the JVM has `CAP_SYS_PTRACE`. The process/module lookup throws `ProcessNotFoundException` / `ModuleNotFoundException`. All of these extend `Mem4JException` (a `RuntimeException`) so a single catch is enough.
 
 ---
 
@@ -130,7 +136,7 @@ Pointer base = Pointer.getBaseAddress("game.exe"); // Windows
 Pointer base = Pointer.getBaseAddress("game");     // Linux binary name
 ```
 
-If the process cannot be found the library aborts (MessageBox on Windows, stderr on Linux) and calls `System.exit(-1)`. The returned `Pointer` carries an internal `offset` initialised to `0`.
+If no process matches, `ProcessNotFoundException` is thrown. If the process is found but its main module is not visible (e.g. the JVM lacks permission to read its mappings), `ModuleNotFoundException` is thrown. The returned `Pointer` carries an internal `offset` initialised to `0` and **must be closed** (`Pointer` is `AutoCloseable` — use a try-with-resources block).
 
 ### Reading and writing typed values
 
@@ -148,9 +154,34 @@ Memory.writeMemory(base, 0x00ABCE00L, 12.5f,     Float.class);
 Memory.writeMemory(base, 0x00ABCE10L, 0.75d,     Double.class);
 ```
 
-Supported types: `Integer.class`, `Long.class`, `Float.class`, `Double.class`. Any other type throws `IllegalArgumentException`.
+Supported types: `Byte.class`, `Short.class`, `Integer.class`, `Long.class`, `Float.class`, `Double.class`. Any other type throws `IllegalArgumentException`. Failed reads throw `MemoryAccessException` (e.g. unmapped page, insufficient page protection).
 
-Internally each call does `baseAddr.copy().add((int) offset)` so the supplied `base` is not mutated between calls.
+The `offset` parameter is honoured for its full `long` range — earlier versions silently truncated it to 32 bits. Internally each call does `baseAddr.copy().add(offset)` so the supplied `base` is not mutated between calls.
+
+### Bulk I/O and strings
+
+```java
+try (Pointer base = Pointer.getBaseAddress("game.exe")) {
+    Pointer p = base.copy().add(0x1000);
+
+    byte[] header = p.readBytes(64);
+
+    String name = p.copy().add(0x100).readString(32);                          // UTF-8, NUL-terminated
+    String wide = p.copy().add(0x100).readString(32, StandardCharsets.UTF_16LE);
+
+    p.copy().add(0x200).writeBytes(new byte[]{ 0x48, 0x65, 0x6C, 0x6C, 0x6F });
+    p.copy().add(0x200).writeString("Hello");
+}
+```
+
+### Endianness
+
+By default a `Pointer` decodes little-endian. To target a big-endian process (e.g. ARM), call `withByteOrder` once:
+
+```java
+Pointer p = base.copy().add(0x1234).withByteOrder(ByteOrder.BIG_ENDIAN);
+int value = p.readInt();
+```
 
 ### Pointer chains (multi-level pointers)
 
@@ -169,43 +200,116 @@ Pointer p = base.copy()
 int hp = Memory.readMemory(p, 0L, Integer.class);
 ```
 
-| Method        | Effect                                                          |
-|---------------|-----------------------------------------------------------------|
-| `copy()`      | Returns a new `Pointer` with the same handle, base, and offset. Use this before mutating to avoid touching the original. |
-| `add(int)`    | Adds bytes to the current offset and returns `this` (mutable, fluent). |
-| `indirect64()`| Reads a 64-bit pointer at the current address, replaces the base with that value, and resets the offset to `0`. |
-| `toString()`  | Pretty-prints as `module[0xBASE]+0xOFFSET => 0xFINAL`.          |
+| Method            | Effect                                                          |
+|-------------------|-----------------------------------------------------------------|
+| `copy()`          | Returns a new `Pointer` with the same handle, base, offset and byte order. Use this before mutating to avoid touching the original. |
+| `add(long)`       | Adds bytes to the current offset and returns `this` (mutable, fluent). Accepts the full `long` range. |
+| `indirect64()`    | Reads a 64-bit pointer at the current address, replaces the base with that value, and resets the offset to `0`. |
+| `indirect32()`    | Same as `indirect64()` but reads a zero-extended 32-bit pointer — use against 32-bit targets. |
+| `withByteOrder()` | Switch this pointer's endianness for subsequent reads/writes.  |
+| `close()`         | Release the underlying OS handle / file descriptor.            |
+| `toString()`      | Pretty-prints as `module[0xBASE]+0xOFFSET => 0xFINAL`.         |
 
 ### Signature (AOB) scanning
 
-> ⚠️ **Windows-only.** `SignatureManager` and `SignatureUtil` are coupled to `WinNT.HANDLE`/`Kernel32.ReadProcessMemory`. The cross-platform `Pointer`/`Memory` APIs above work on Linux; AOB scanning currently does not.
-
-When offsets shift between builds, byte signatures are more stable. `SignatureManager` scans the target module's address range for a pattern and returns the relative offset of the matched address:
+When offsets shift between builds, byte signatures are more stable. `SignatureManager` scans the target module's address range for a pattern and returns the relative offset of the matched address — **cross-platform**:
 
 ```java
-import com.sun.jna.platform.win32.WinNT;
-import it.adrian.code.interfaces.Kernel32;
+import it.adrian.code.memory.Pointer;
 import it.adrian.code.signatures.SignatureManager;
-import it.adrian.code.utilities.ProcessUtil;
-
-int pid = ProcessUtil.getProcessPidByName("game.exe");
-WinNT.HANDLE handle = Kernel32.INSTANCE.OpenProcess(0x0010 | 0x0020 | 0x0008, false, pid);
-
-SignatureManager sm = new SignatureManager(handle, "game.exe", pid);
 
 byte[] pattern = new byte[] {
     (byte) 0x48, (byte) 0x8B, 0x00, 0x00, (byte) 0x05, 0x00, 0x00, 0x00, (byte) 0xC3
 };
 String mask = "xx??x???x";
 
-Pointer base = Pointer.getBaseAddress("game.exe");
-long relativeOffset = sm.getPtrFromSignature(/* JNA pointer to base */ null /* see note */,
-                                             pattern, mask);
+try (Pointer base = Pointer.getBaseAddress("game.exe")) {
+    SignatureManager sm = new SignatureManager(base);
+    long relativeOffset = sm.getPtrFromSignature(base.getBaseAddressValue(), pattern, mask);
+    int value = Memory.readMemory(base, relativeOffset, Integer.class);
+}
 ```
 
-The mask uses `'x'` for "must match exactly" and any other character (typically `'?'`) for "wildcard". `getPtrFromSignature` interprets the matched site as a `mov`/`lea`-style RIP-relative instruction: it reads the 4-byte displacement at `match+3`, then computes `match + displacement + 7`, returning the final address as an offset relative to the module base. The handle is closed at the end of the call.
+The mask uses `'x'` for "must match exactly" and any other character (typically `'?'`) for "wildcard". `getPtrFromSignature` interprets the matched site as a `mov`/`lea`-style RIP-relative instruction: it reads the 4-byte displacement at `match+3`, then computes `match + displacement + 7`, returning the final address as an offset relative to the module base. Unlike older releases, `SignatureManager` no longer closes the underlying handle — the caller owns the lifecycle (use try-with-resources on the `Pointer`).
 
-> ⚠️ The current `SignatureManager` API takes a `com.sun.jna.Pointer` (not the Mem4J `Pointer`) for the module base. You can obtain one from `ProcessUtil.getModule(pid, name).modBaseAddr`.
+### Writing to protected memory
+
+By default `WriteProcessMemory` (Windows) and `/proc/<pid>/mem` (Linux) handle most pages transparently, but writing into a `PAGE_EXECUTE_READ` section on Windows usually fails. Use `Pointer.force()` to bypass that:
+
+```java
+try (Pointer base = Pointer.getBaseAddress("game.exe")) {
+    // Patch a single instruction (5 bytes) inside the .text section.
+    byte[] nopSled = {(byte)0x90,(byte)0x90,(byte)0x90,(byte)0x90,(byte)0x90};
+    base.copy().add(0x1234).force().writeBytes(nopSled);
+    // On Windows the page protection is restored to its original value after the write.
+    // On Linux the call simply forwards to /proc/<pid>/mem (which already ignores protection).
+}
+```
+
+### Memory protection and allocation *(Windows-only)*
+
+```java
+try (Pointer base = Pointer.getBaseAddress("game.exe")) {
+    NativeAccess na = NativeAccess.get();
+
+    // Make 4 KiB at base+0x1000 writable+executable for a hook.
+    base.copy().add(0x1000).protect(0x1000, MemoryProtection.READ_WRITE_EXECUTE);
+
+    // Query the current protection of a region.
+    MemoryProtection prot = na.queryProtection(base.getSession(), base.getBaseAddressValue() + 0x2000);
+
+    // Allocate a remote 4 KiB block for a code cave.
+    long cave = na.allocate(base.getSession(), 0x1000, MemoryProtection.READ_WRITE_EXECUTE);
+    na.writeMemory(base.getSession(), cave, shellcode, shellcode.length);
+    // ...
+    na.free(base.getSession(), cave, 0);
+}
+```
+
+On Linux `protect`, `allocate` and `free` throw `UnsupportedOperationException` — remote `mprotect` / `mmap` would require injecting a syscall via `ptrace`, which is outside this library's scope. `queryProtection` is supported on Linux via `/proc/<pid>/maps`.
+
+### Linux examples
+
+```java
+// Read the ELF magic of any running Java process from its own VM.
+// Run with: sudo java -cp Mem4J:jna:jna-platform Demo
+try (Pointer base = Pointer.getBaseAddress("java")) {
+    byte[] magic = base.readBytes(4);
+    // → 7F 45 4C 46  ("\x7FELF")
+
+    // Walk every loaded shared library of the process.
+    for (ModuleInfo m : ProcessUtil.listModules(base.getSession().pid)) {
+        System.out.printf("0x%016x %s%n", m.baseAddress(), m.path());
+    }
+}
+```
+
+```java
+// Patch a global variable inside the heap of another process.
+// The Linux binary name is whatever appears in /proc/<pid>/comm (no .exe suffix).
+try (Pointer base = Pointer.getBaseAddress("my_game")) {
+    long hpOffset = 0x00045128L;
+    int  current  = Memory.readMemory(base, hpOffset, Integer.class);
+    Memory.writeMemory(base, hpOffset, 9999, Integer.class);
+}
+```
+
+```java
+// Follow a 4-level pointer chain in a 64-bit Linux process (Cheat-Engine style).
+try (Pointer base = Pointer.getBaseAddress("Hollow_Knight.x86_64")) {
+    Pointer hp = base.copy()
+            .add(0x01F2C720)
+            .indirect64().add(0xB0)
+            .indirect64().add(0x28)
+            .indirect64().add(0x1C);
+    System.out.println("HP = " + hp.readInt());
+}
+```
+
+Linux notes:
+- Run as `root`, or grant the JVM `CAP_SYS_PTRACE` (`sudo setcap cap_sys_ptrace+ep $(realpath $(which java))`). Otherwise `/proc/<pid>/mem` cannot be opened for processes you don't own.
+- Many distros set `kernel.yama.ptrace_scope=1`. To attach to a non-child process, either run as root or set `sysctl kernel.yama.ptrace_scope=0`.
+- The process name is matched against `/proc/<pid>/comm` (truncated to 15 chars) and the basename of `/proc/<pid>/exe`, in that order. If two processes share the same name, the first match wins.
 
 ### Utilities
 
@@ -215,9 +319,14 @@ The mask uses `'x'` for "must match exactly" and any other character (typically 
 | `NativeAccess.findPidByName(String)`            | both     | First PID whose executable name matches.                                |
 | `NativeAccess.getModuleBaseAddress(pid, name)`  | both     | Base address of a loaded module / mapped binary.                        |
 | `NativeAccess.getModuleSize(pid, name)`         | both     | Mapped size of the module (max end − min start across mappings on Linux). |
+| `NativeAccess.listModules(int pid)`             | both     | Every loaded module / mapped binary as `List<ModuleInfo>`.              |
+| `NativeAccess.protect/allocate/free`            | Windows  | `VirtualProtectEx` / `VirtualAllocEx` / `VirtualFreeEx`. Throws on Linux. |
+| `NativeAccess.queryProtection(session, addr)`   | both     | Current page protection at the address; reads `/proc/<pid>/maps` on Linux. |
+| `Pointer.force()`                               | both     | Returns a sibling pointer that flips protection around its writes (no-op on Linux). |
 | `NativeAccess.isPrivileged()`                   | both     | Admin on Windows, `euid == 0` on Linux.                                 |
 | `ProcessUtil.getProcessPidByName(String)`       | both     | Thin wrapper around `NativeAccess.findPidByName`.                       |
-| `ProcessUtil.getModule(int pid, String name)`   | Windows  | Returns the `MODULEENTRY32W` for the named module (case-insensitive). Throws on Linux. |
+| `ProcessUtil.listModules(int pid)`              | both     | Thin wrapper around `NativeAccess.listModules`.                         |
+| `ProcessUtil.getModule(int pid, String name)`   | Windows  | *Deprecated.* Returns the `MODULEENTRY32W` for the named module. Throws on Linux. |
 | `Shell32Util.isUserWindowsAdmin()`              | Windows  | Returns `true` if the current process has Administrator rights; `false` on Linux. |
 
 ---
@@ -228,31 +337,58 @@ The mask uses `'x'` for "must match exactly" and any other character (typically 
 Memory
   static <T> T    readMemory(Pointer base, long offset, Class<T> type)
   static <T> void writeMemory(Pointer base, long offset, T value, Class<T> type)
+                  // T ∈ { Byte, Short, Integer, Long, Float, Double }
 
-Pointer
+Pointer (implements AutoCloseable)
   static Pointer  getBaseAddress(String processName)
-  static Pointer  getModuleBaseAddress(int pid, String moduleName)   // returns com.sun.jna.Pointer
   Pointer         copy()
-  Pointer         add(int bytes)
+  Pointer         add(long bytes)
   Pointer         indirect64()
-  int             readInt()        boolean writeInt(int)
-  long            readLong()       boolean writeLong(long)
-  float           readFloat()      boolean writeFloat(float)
-  double          readDouble()     boolean writeDouble(double)
+  Pointer         indirect32()
+  Pointer         withByteOrder(ByteOrder order)
+  byte/short/int/long/float/double  read*()
+  boolean         write*(value)
+  byte[]          readBytes(int len)         boolean writeBytes(byte[])
+  String          readString(int max [, Charset])
+  boolean         writeString(String [, Charset])
+  boolean         protect(long size, MemoryProtection)
+  Pointer         force()                                  // bypass page protection on writes
+  void            close()
 
-SignatureManager(WinNT.HANDLE pHandle, String processName, int pid)
-  long            getPtrFromSignature(com.sun.jna.Pointer base, byte[] sig, String mask)
+NativeAccess
+  static NativeAccess          get()
+  int                          findPidByName(String)
+  long                         getModuleBaseAddress(int pid, String name)
+  long                         getModuleSize(int pid, String name)
+  List<ModuleInfo>             listModules(int pid)
+  ProcessSession               openProcess(int pid)
+  boolean                      readMemory/writeMemory(session, address, byte[], length)
+  boolean                      protect(session, address, size, MemoryProtection)        // Windows
+  long                         allocate(session, size, MemoryProtection)                // Windows
+  boolean                      free(session, address, size)                             // Windows
+  MemoryProtection             queryProtection(session, address)
+  void                         closeSession(ProcessSession)
+  boolean                      isPrivileged()
+  void                         ensurePrivileged()  // throws PrivilegeException
+
+SignatureManager(Pointer)
+SignatureManager(ProcessSession, String moduleName)
+  long            getPtrFromSignature(long moduleBaseAddress, byte[] sig, String mask)
 
 SignatureUtil
-  static long     findSignature(WinNT.HANDLE handle, long start, long size, byte[] sig, String mask)
-  static int      readInt(WinNT.HANDLE handle, long address)
+  static long     findSignature(ProcessSession session, long start, long size, byte[] sig, String mask)
+  static int      readInt(ProcessSession session, long address)
 
 ProcessUtil
   static int                   getProcessPidByName(String name)
-  static MODULEENTRY32W        getModule(int pid, String name)
+  static List<ModuleInfo>      listModules(int pid)
 
-Shell32Util
-  static boolean               isUserWindowsAdmin()
+Exceptions (it.adrian.code.exceptions)
+  Mem4JException                       // root, extends RuntimeException
+   ├── PrivilegeException
+   ├── ProcessNotFoundException
+   ├── ModuleNotFoundException
+   └── MemoryAccessException
 ```
 
 ---
@@ -263,6 +399,8 @@ The read/write primitives map to fixed-width writes/reads in the target process,
 
 | Java type | Bytes written/read |
 |-----------|--------------------|
+| `byte`    | 1                  |
+| `short`   | 2                  |
 | `int`     | 4                  |
 | `long`    | 8                  |
 | `float`   | 4                  |
@@ -276,9 +414,8 @@ The read/write primitives map to fixed-width writes/reads in the target process,
 - **Bitness must match.** A 32-bit JVM cannot operate on a 64-bit target (or vice versa). Use the appropriate JDK distribution.
 - **No anti-cheat / kernel bypass.** Memory access goes through documented OS APIs. On Windows, targets protected by anti-tamper drivers or Protected Process Light (PPL) reject `OpenProcess` with `ERROR_ACCESS_DENIED`. On Linux, processes marked non-dumpable or owned by another user with no `CAP_SYS_PTRACE` cannot be opened.
 - **Process attachment is by executable name only.** If two processes share the same name, the first match wins.
-- **`indirect64()` assumes a 64-bit pointer.** There is no `indirect32()` variant; on 32-bit targets you would need to extend the API.
-- **AOB scanning is Windows-only.** `SignatureManager` / `SignatureUtil` use `WinNT.HANDLE` directly. A cross-platform implementation on top of `NativeAccess` is on the roadmap.
-- **The library calls `System.exit(-1)`** on missing privileges or missing process. This is intentional for the typical "trainer" use case but may be inconvenient when embedding Mem4J inside a larger application.
+- **Memory protection and remote allocation are Windows-only.** Implementing them on Linux requires injecting a syscall via `ptrace`, which is out of scope.
+- **No test suite yet.** Validation is done via local smoke programs against `/proc/self/mem`. Coverage is planned as a follow-up.
 
 ---
 
@@ -290,7 +427,7 @@ cd Mem4J
 mvn -B package
 ```
 
-Artifacts land in `target/`. CI runs the same `mvn -B package` on every push to `master` (see [`.github/workflows/maven.yml`](.github/workflows/maven.yml)).
+Artifacts land in `target/`: the runtime jar, a sources jar and a Javadoc jar (the last two so IDEs of downstream consumers can show docs and step into Mem4J sources). CI runs the same `mvn -B package` on both `ubuntu-latest` and `windows-latest` for every push and pull request targeting `master` (see [`.github/workflows/maven.yml`](.github/workflows/maven.yml)).
 
 ---
 
@@ -304,4 +441,4 @@ Artifacts land in `target/`. CI runs the same `mvn -B package` on every push to 
 
 ## License
 
-No license file is currently bundled with the repository. Until one is added, treat the code as "all rights reserved" by the repository owner. Open an issue if you need a clarification on permitted use.
+[MIT](LICENSE). See [`LICENSE`](LICENSE) for the full text.
