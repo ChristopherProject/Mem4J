@@ -2,6 +2,8 @@ package it.adrian.code.platform.linux;
 
 import com.sun.jna.Library;
 import com.sun.jna.Native;
+import it.adrian.code.platform.MemoryProtection;
+import it.adrian.code.platform.ModuleInfo;
 import it.adrian.code.platform.NativeAccess;
 import it.adrian.code.platform.ProcessSession;
 
@@ -10,6 +12,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Stream;
 
 public class LinuxAccess extends NativeAccess {
@@ -108,6 +114,33 @@ public class LinuxAccess extends NativeAccess {
         return min == Long.MAX_VALUE ? 0L : max - min;
     }
 
+    @Override
+    public List<ModuleInfo> listModules(int pid) {
+        Map<String, long[]> aggregate = new LinkedHashMap<>();
+        try (BufferedReader reader = Files.newBufferedReader(Paths.get("/proc/" + pid + "/maps"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                MapEntry entry = parseMapLine(line);
+                if (entry == null || entry.path == null) continue;
+                long[] range = aggregate.computeIfAbsent(entry.path, k -> new long[]{Long.MAX_VALUE, 0L});
+                if (entry.start < range[0]) range[0] = entry.start;
+                if (entry.end > range[1]) range[1] = entry.end;
+            }
+        } catch (IOException ignored) {
+            return new ArrayList<>();
+        }
+        List<ModuleInfo> result = new ArrayList<>(aggregate.size());
+        for (Map.Entry<String, long[]> e : aggregate.entrySet()) {
+            String fullPath = e.getKey();
+            int slash = fullPath.lastIndexOf('/');
+            String name = slash < 0 ? fullPath : fullPath.substring(slash + 1);
+            long base = e.getValue()[0];
+            long size = e.getValue()[1] - base;
+            result.add(new ModuleInfo(name, fullPath, base, size));
+        }
+        return result;
+    }
+
     private static boolean matchesModule(String fullPath, String moduleName) {
         if (fullPath.equals(moduleName)) return true;
         int slash = fullPath.lastIndexOf('/');
@@ -183,6 +216,61 @@ public class LinuxAccess extends NativeAccess {
     }
 
     @Override
+    public boolean protect(ProcessSession session, long address, long size, MemoryProtection protection) {
+        throw new UnsupportedOperationException(
+                "Memory protection of a remote process is not implemented on Linux. " +
+                        "It would require injecting an mprotect(2) syscall via ptrace.");
+    }
+
+    @Override
+    public MemoryProtection queryProtection(ProcessSession session, long address) {
+        try (BufferedReader reader = Files.newBufferedReader(Paths.get("/proc/" + session.pid + "/maps"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                MapEntry entry = parseMapLine(line);
+                if (entry == null) continue;
+                if (Long.compareUnsigned(address, entry.start) >= 0 &&
+                        Long.compareUnsigned(address, entry.end) < 0) {
+                    return parseProtFlags(line);
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return null;
+    }
+
+    private static MemoryProtection parseProtFlags(String line) {
+        int space = line.indexOf(' ');
+        if (space < 0 || line.length() < space + 5) return null;
+        char r = line.charAt(space + 1);
+        char w = line.charAt(space + 2);
+        char x = line.charAt(space + 3);
+        boolean readable = (r == 'r');
+        boolean writable = (w == 'w');
+        boolean executable = (x == 'x');
+        if (!readable && !writable && !executable) return MemoryProtection.NONE;
+        if (readable && writable && executable) return MemoryProtection.READ_WRITE_EXECUTE;
+        if (readable && writable) return MemoryProtection.READ_WRITE;
+        if (readable && executable) return MemoryProtection.READ_EXECUTE;
+        if (readable) return MemoryProtection.READ;
+        return null;
+    }
+
+    @Override
+    public long allocate(ProcessSession session, long size, MemoryProtection protection) {
+        throw new UnsupportedOperationException(
+                "Remote memory allocation is not implemented on Linux. " +
+                        "It would require injecting an mmap(2) syscall via ptrace.");
+    }
+
+    @Override
+    public boolean free(ProcessSession session, long address, long size) {
+        throw new UnsupportedOperationException(
+                "Remote memory free is not implemented on Linux. " +
+                        "It would require injecting a munmap(2) syscall via ptrace.");
+    }
+
+    @Override
     public void closeSession(ProcessSession session) {
         if (session == null) return;
         try {
@@ -201,15 +289,7 @@ public class LinuxAccess extends NativeAccess {
     }
 
     @Override
-    public void abortMissingPrivileges() {
-        System.err.println("Mem4J: this operation requires elevated privileges " +
-                "(run as root or grant CAP_SYS_PTRACE to the JVM).");
-        System.exit(-1);
-    }
-
-    @Override
-    public void abortProcessNotFound(String processName) {
-        System.err.println("Mem4J: process to attach not found: " + processName);
-        System.exit(-1);
+    protected String privilegeErrorMessage() {
+        return "Mem4J: this operation requires root or CAP_SYS_PTRACE on Linux.";
     }
 }

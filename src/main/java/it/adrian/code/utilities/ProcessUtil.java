@@ -5,19 +5,26 @@ import com.sun.jna.platform.win32.Tlhelp32;
 import com.sun.jna.platform.win32.WinDef;
 import com.sun.jna.platform.win32.WinNT;
 import it.adrian.code.interfaces.Kernel32;
+import it.adrian.code.platform.ModuleInfo;
 import it.adrian.code.platform.NativeAccess;
+
+import java.util.List;
 
 public class ProcessUtil {
 
     /**
      * Returns the module entry (Windows-only) for the named module of the given pid.
      * On Linux this throws {@link UnsupportedOperationException} — use
-     * {@link NativeAccess#getModuleBaseAddress(int, String)} / {@link NativeAccess#getModuleSize(int, String)} instead.
+     * {@link #listModules(int)} instead.
+     *
+     * @deprecated Use {@link #listModules(int)} and filter by name; the Win32
+     * {@code MODULEENTRY32W} return type makes this method inherently non-portable.
      */
+    @Deprecated
     public static Tlhelp32.MODULEENTRY32W getModule(int pid, String moduleName) {
         if (!com.sun.jna.Platform.isWindows()) {
             throw new UnsupportedOperationException(
-                    "ProcessUtil.getModule is Windows-only; use NativeAccess.get().getModuleBaseAddress/Size on Linux.");
+                    "ProcessUtil.getModule is Windows-only; use ProcessUtil.listModules(pid) on Linux.");
         }
         WinNT.HANDLE snapshotModules = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Kernel32.TH32CS_SNAPMODULE, new WinDef.DWORD(pid));
         WinNT.HANDLE snapshotModules32 = Kernel32.INSTANCE.CreateToolhelp32Snapshot(Kernel32.TH32CS_SNAPMODULE32, new WinDef.DWORD(pid));
@@ -52,5 +59,14 @@ public class ProcessUtil {
 
     public static int getProcessPidByName(String pName) {
         return NativeAccess.get().findPidByName(pName);
+    }
+
+    /**
+     * Cross-platform module enumeration. Returns every loaded module / mapped
+     * binary visible in the target process, with name, full path, base address
+     * and size.
+     */
+    public static List<ModuleInfo> listModules(int pid) {
+        return NativeAccess.get().listModules(pid);
     }
 }

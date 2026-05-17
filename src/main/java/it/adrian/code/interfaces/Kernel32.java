@@ -2,6 +2,7 @@ package it.adrian.code.interfaces;
 
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
+import com.sun.jna.platform.win32.BaseTSD;
 import com.sun.jna.platform.win32.Tlhelp32;
 import com.sun.jna.platform.win32.WinDef;
 import com.sun.jna.platform.win32.WinNT;
@@ -29,4 +30,12 @@ public interface Kernel32 extends StdCallLibrary {
     WinNT.HANDLE OpenProcess(int fdwAccess, boolean fInherit, int IDProcess);
 
     boolean CloseHandle(WinNT.HANDLE hObject);
+
+    boolean VirtualProtectEx(WinNT.HANDLE hProcess, Pointer lpAddress, BaseTSD.SIZE_T dwSize, int flNewProtect, IntByReference lpflOldProtect);
+
+    Pointer VirtualAllocEx(WinNT.HANDLE hProcess, Pointer lpAddress, BaseTSD.SIZE_T dwSize, int flAllocationType, int flProtect);
+
+    boolean VirtualFreeEx(WinNT.HANDLE hProcess, Pointer lpAddress, BaseTSD.SIZE_T dwSize, int dwFreeType);
+
+    BaseTSD.SIZE_T VirtualQueryEx(WinNT.HANDLE hProcess, Pointer lpAddress, com.sun.jna.platform.win32.WinNT.MEMORY_BASIC_INFORMATION lpBuffer, BaseTSD.SIZE_T dwLength);
 }
