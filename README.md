@@ -95,20 +95,44 @@ NativeAccess (abstract)
 
 ## Quick start
 
+The same code works on Windows and Linux — only the process name differs (Windows wants the `.exe`, Linux wants whatever appears in `/proc/<pid>/comm`).
+
+**Windows** (run as Administrator):
+
 ```java
 import it.adrian.code.Memory;
 import it.adrian.code.memory.Pointer;
 
-public class Example {
+public class WindowsExample {
     public static void main(String[] args) {
-        // Attach to the target process by executable name.
-        // Windows: "notepad.exe"; Linux: the binary name as in /proc/<pid>/comm (e.g. "firefox").
-        // try-with-resources releases the OS handle / fd on exit.
+        // try-with-resources releases the OS handle on exit.
         try (Pointer base = Pointer.getBaseAddress("notepad.exe")) {
 
             // Read an int 0x1234 bytes past the module base.
             int value = Memory.readMemory(base, 0x1234L, Integer.class);
-            System.out.println("Value at +0x1234 = " + value);
+            System.out.println("Value at notepad.exe+0x1234 = " + value);
+
+            // Write a new int back to the same location.
+            Memory.writeMemory(base, 0x1234L, 42, Integer.class);
+        }
+    }
+}
+```
+
+**Linux** (run as `root`, or grant the JVM `CAP_SYS_PTRACE` — see [Linux examples](#linux-examples) below):
+
+```java
+import it.adrian.code.Memory;
+import it.adrian.code.memory.Pointer;
+
+public class LinuxExample {
+    public static void main(String[] args) {
+        // try-with-resources closes /proc/<pid>/mem on exit.
+        try (Pointer base = Pointer.getBaseAddress("firefox")) {
+
+            // Read an int 0x1234 bytes past the main binary's base address.
+            int value = Memory.readMemory(base, 0x1234L, Integer.class);
+            System.out.println("Value at firefox+0x1234 = " + value);
 
             // Write a new int back to the same location.
             Memory.writeMemory(base, 0x1234L, 42, Integer.class);
