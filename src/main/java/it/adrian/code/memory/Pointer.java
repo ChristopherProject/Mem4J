@@ -52,6 +52,23 @@ public class Pointer implements AutoCloseable {
         if (pid == 0) {
             throw new ProcessNotFoundException(processName);
         }
+        return attachByPid(na, processName, pid);
+    }
+
+    /**
+     * Attach to the process identified by {@code pid} and resolve the base address of
+     * the module / mapped binary whose name matches {@code processName}. Use this
+     * overload when several processes share the same executable name and you have
+     * already disambiguated the right PID (e.g. via {@link it.adrian.code.utilities.ProcessUtil#listModules(int)}
+     * or any external process inspector).
+     *
+     * @throws ModuleNotFoundException if the module cannot be located inside that PID.
+     */
+    public static Pointer getBaseAddress(String processName, int pid) {
+        return attachByPid(NativeAccess.get(), processName, pid);
+    }
+
+    private static Pointer attachByPid(NativeAccess na, String processName, int pid) {
         ProcessSession session = na.openProcess(pid);
         long base = na.getModuleBaseAddress(pid, processName);
         if (base == 0L) {
