@@ -11,14 +11,14 @@ It runs on **both Windows and Linux** behind the same `Pointer` / `Memory` API. 
 
 ## Features
 
-- **Process attachment** — open a remote handle / file descriptor by executable name (`Pointer.getBaseAddress(String)`). `Pointer` implements `AutoCloseable`, so the handle is released on `close()`.
+- **Process attachment** — open a remote handle / file descriptor by executable name (`Pointer.getBaseAddress(String)`), or by name + PID for ambiguous matches (`Pointer.getBaseAddress(String, int)`). `Pointer` implements `AutoCloseable`, so the handle is released on `close()`.
 - **Module base resolution** — locate the in-memory base address of a loaded module / mapped binary.
 - **Module enumeration** — `ProcessUtil.listModules(pid)` returns every loaded module with name, full path, base address and size (cross-platform).
 - **Typed read/write** — `byte`, `short`, `int`, `long`, `float`, `double`. Endianness is configurable per `Pointer` via `withByteOrder(ByteOrder)`.
 - **Bulk I/O & strings** — `readBytes` / `writeBytes` for raw buffers; `readString` / `writeString` for NUL-terminated or fixed-length strings in any `Charset`.
 - **Pointer chains** — dereference 64-bit *and* 32-bit pointers, chain offsets fluently with `copy()`, `add()`, `indirect64()`, `indirect32()`.
 - **Signature (AOB) scanning** — locate an address inside the target's memory using a byte pattern + mask (`"xx?xx??x"`). **Cross-platform**: same API on Windows and Linux.
-- **Write into protected memory** — `Pointer.force()` returns a sibling pointer whose writes flip the affected pages to writable, perform the write, then restore the original protection. Works for read-only and executable mappings (e.g. patching `.text`).
+- **Write into protected memory** — `Pointer.force()` returns a sibling pointer whose writes bypass page protection. On Windows the dance flips the affected pages to `PAGE_EXECUTE_READWRITE`, performs the write, then restores the original protection (e.g. patching `.text`). On Linux it is a no-op because `/proc/<pid>/mem` already ignores page protection for `CAP_SYS_PTRACE` callers.
 - **Memory protection & allocation** — wrappers for `VirtualProtectEx`, `VirtualAllocEx`, `VirtualFreeEx`, `VirtualQueryEx` on Windows (production-ready). On **Linux x86_64** the same operations are emulated by injecting an `mprotect`/`mmap`/`munmap` syscall into the target via `ptrace` — **experimental**; see the [dedicated section](#memory-protection-and-allocation) for caveats. `queryProtection` works reliably on both backends without injection (reads `/proc/<pid>/maps` on Linux).
 - **Embedding-friendly error handling** — every failure raises an exception from the `Mem4JException` hierarchy. No more `System.exit(-1)` or `MessageBox` pop-ups.
 
@@ -86,10 +86,12 @@ Platform dispatch is centralised in `it.adrian.code.platform.NativeAccess`. The 
 ```
 NativeAccess (abstract)
  ├── WindowsAccess  → kernel32 / user32 / shell32 via JNA
- └── LinuxAccess    → /proc/<pid>/maps, /proc/<pid>/mem, libc geteuid
+ │                    (Virtual{Protect,Alloc,Free,Query}Ex for memory protection)
+ └── LinuxAccess    → /proc/<pid>/{maps,mem,comm,exe}, libc geteuid
+                      (ptrace syscall injection for mprotect / mmap / munmap on x86_64)
 ```
 
-`Pointer`, `Memory`, `ProcessUtil.listModules`, `SignatureManager` and `SignatureUtil` route every read, write, lookup, privilege check and AOB scan through this interface, so the same call sites work on both platforms. The remaining Windows-specific helpers (`ProcessUtil.getModule`, `Shell32Util`, and the legacy `WinNT.HANDLE`-based overloads of `SignatureManager`/`SignatureUtil`) are kept as `@Deprecated` shims for existing Windows callers.
+`Pointer`, `Memory`, `ProcessUtil.listModules`, `SignatureManager` and `SignatureUtil` route every read, write, lookup, privilege check, AOB scan, protection query and allocation through this interface, so the same call sites work on both platforms. The remaining Windows-specific helpers (`ProcessUtil.getModule`, `Shell32Util`, and the legacy `WinNT.HANDLE`-based overloads of `SignatureManager` / `SignatureUtil` / `Pointer`'s constructor) are kept as `@Deprecated` shims for existing Windows callers.
 
 ---
 
@@ -314,7 +316,7 @@ Implementation:
 | `NativeAccess.queryProtection(session, addr)`   | both     | Current page protection at the address; reads `/proc/<pid>/maps` on Linux.                                             |
 | `NativeAccess.protect / allocate / free`        | both     | `VirtualProtectEx` / `VirtualAllocEx` / `VirtualFreeEx` on Windows; `mprotect(2)` / `mmap(2)` / `munmap(2)` injected via `ptrace` on Linux x86_64. |
 | `NativeAccess.isPrivileged()`                   | both     | Admin on Windows, `euid == 0` on Linux.                                                                                |
-| `Pointer.force()`                               | both     | Returns a sibling pointer that flips protection around its writes (no-op on Linux).                                    |
+| `Pointer.force()`                               | both     | Returns a sibling pointer whose writes flip protection around them on Windows; no-op on Linux (`/proc/<pid>/mem` already bypasses protection). |
 | `ProcessUtil.getProcessPidByName(String)`       | both     | Thin wrapper around `NativeAccess.findPidByName`.                                                                      |
 | `ProcessUtil.listModules(int pid)`              | both     | Thin wrapper around `NativeAccess.listModules`.                                                                        |
 | `ProcessUtil.getModule(int pid, String name)`   | Windows  | *Deprecated.* Returns the raw `MODULEENTRY32W`. Throws on Linux.                                                       |
@@ -383,48 +385,59 @@ Memory
                   // T ∈ { Byte, Short, Integer, Long, Float, Double }
 
 Pointer (implements AutoCloseable)
-  static Pointer  getBaseAddress(String processName)
-  static Pointer  getBaseAddress(String processName, int pid)   // disambiguate by PID
-  Pointer         copy()
-  Pointer         add(long bytes)
-  Pointer         indirect64()
-  Pointer         indirect32()
+  static Pointer  getBaseAddress(String processName)                  // PID resolved automatically
+  static Pointer  getBaseAddress(String processName, int pid)         // disambiguate by PID
+  Pointer         copy()                                              // sibling, shares the OS handle
+  Pointer         add(long bytes)                                     // fluent, mutates this
+  Pointer         indirect64()                                        // deref 64-bit pointer
+  Pointer         indirect32()                                        // deref 32-bit pointer (zero-extended)
   Pointer         withByteOrder(ByteOrder order)
-  Pointer         force()                                 // bypass page protection on writes
+  Pointer         force()                                             // bypass page protection on writes
   byte / short / int / long / float / double  read*()
   boolean         write*(value)
-  byte[]          readBytes(int len)                      boolean writeBytes(byte[])
-  String          readString(int max [, Charset])         boolean writeString(String [, Charset])
-  boolean         protect(long size, MemoryProtection)    // Windows
-  void            close()
+  byte[]          readBytes(int len)                                  boolean writeBytes(byte[])
+  String          readString(int max [, Charset])                     boolean writeString(String [, Charset])
+  com.sun.jna.Memory getMemory(int size)                              // raw JNA buffer copy
+  boolean         protect(long size, MemoryProtection)                // delegates to NativeAccess
+  ProcessSession  getSession()
+  long            getBaseAddressValue()
+  long            getOffset()
+  void            close()                                             // releases the session
 
 NativeAccess
-  static NativeAccess  get()
+  static NativeAccess  get()                                            // lazy, picks one backend
   int                  findPidByName(String)
   long                 getModuleBaseAddress(int pid, String name)
   long                 getModuleSize(int pid, String name)
   List<ModuleInfo>     listModules(int pid)
   ProcessSession       openProcess(int pid)
   boolean              readMemory / writeMemory(session, address, byte[], length)
-  MemoryProtection     queryProtection(session, address)
-  boolean              protect(session, address, size, MemoryProtection)   // ptrace inject on Linux
-  long                 allocate(session, size, MemoryProtection)            // ptrace inject on Linux
-  boolean              free(session, address, size)                         // ptrace inject on Linux
+  MemoryProtection     queryProtection(session, address)                // /proc/<pid>/maps on Linux
+  boolean              protect(session, address, size, MemoryProtection)  // ptrace inject on Linux x86_64
+  long                 allocate(session, size, MemoryProtection)          // ptrace inject on Linux x86_64
+  boolean              free(session, address, size)                       // ptrace inject on Linux x86_64
   void                 closeSession(ProcessSession)
   boolean              isPrivileged()
   void                 ensurePrivileged()                                 // throws PrivilegeException
+  void                 throwProcessNotFound(String name)                  // helper for backends
 
-SignatureManager(Pointer)
-SignatureManager(ProcessSession, String moduleName)
+SignatureManager(Pointer)                                              // cross-platform
+SignatureManager(ProcessSession, String moduleName)                    // cross-platform
+SignatureManager(WinNT.HANDLE, String, int)                            // @Deprecated, Windows shim
   long  getPtrFromSignature(long moduleBaseAddress, byte[] sig, String mask)
 
 SignatureUtil
   static long  findSignature(ProcessSession session, long start, long size, byte[] sig, String mask)
   static int   readInt(ProcessSession session, long address)
+  // @Deprecated WinNT.HANDLE-based overloads kept for Windows callers
 
 ProcessUtil
   static int               getProcessPidByName(String name)
   static List<ModuleInfo>  listModules(int pid)
+  static MODULEENTRY32W    getModule(int pid, String name)             // @Deprecated, Windows-only
+
+Shell32Util
+  static boolean           isUserWindowsAdmin()                        // false on Linux
 
 Exceptions (it.adrian.code.exceptions)
   Mem4JException                       // root, extends RuntimeException
@@ -490,12 +503,14 @@ The suite is privilege-aware:
 
 - Tests that need `/proc/<pid>/mem` or ptrace use JUnit's `Assumptions.assumeTrue` to **skip cleanly** when the JVM is not privileged. They never `fail` on an unprivileged machine.
 - Windows-specific tests are gated with `@EnabledOnOs(OS.WINDOWS)`; Linux-specific tests with `@EnabledOnOs(OS.LINUX)`.
-- The ptrace injection test additionally skips on non-x86_64 Linux.
+- The `mmap`/`mprotect`/`munmap` round-trip via ptrace injection is currently marked `@Disabled` because the helper deadlocks against targets attached mid-`nanosleep` — see [Memory protection and allocation](#memory-protection-and-allocation) for context. The test body also asserts `amd64`/`x86_64` via `assumeTrue`, so it will additionally skip on other Linux architectures once the `@Disabled` is removed.
+
+Counted today: **11 tests, 1 skipped** (the ptrace round-trip). All other Linux integration tests pass on a privileged JVM.
 
 For local development on Linux:
 
 ```bash
-sudo mvn -B test                       # runs everything, including the ptrace round-trip
+sudo mvn -B test
 # or, without sudo, after granting CAP_SYS_PTRACE to the JVM once
 sudo setcap cap_sys_ptrace+ep "$(realpath "$(which java)")"
 mvn -B test
