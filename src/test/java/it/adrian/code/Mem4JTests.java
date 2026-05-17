@@ -93,6 +93,40 @@ class Mem4JTests {
 
     @Test
     @EnabledOnOs(OS.LINUX)
+    void closing_a_copy_does_not_invalidate_the_root() {
+        NativeAccess na = NativeAccess.get();
+        assumeTrue(na.isPrivileged(), "needs root or CAP_SYS_PTRACE");
+
+        try (Pointer root = Pointer.getBaseAddress("java")) {
+            Pointer copy = root.copy();
+            assertEquals(2, root.getSession().referenceCount(),
+                    "root + copy should bring the refcount to 2");
+            copy.close();
+            assertEquals(1, root.getSession().referenceCount(),
+                    "closing the copy must NOT release the underlying handle");
+
+            // root must still be usable
+            byte[] magic = root.readBytes(4);
+            assertArrayEquals(new byte[]{0x7F, 'E', 'L', 'F'}, magic,
+                    "root pointer should still see the ELF magic after the copy was closed");
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX)
+    void close_is_idempotent() {
+        NativeAccess na = NativeAccess.get();
+        assumeTrue(na.isPrivileged());
+
+        Pointer p = Pointer.getBaseAddress("java");
+        p.close();
+        // Second close must not throw; refcount stays at 0.
+        p.close();
+        assertEquals(0, p.getSession().referenceCount());
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX)
     void reading_unmapped_address_throws() {
         NativeAccess na = NativeAccess.get();
         assumeTrue(na.isPrivileged());

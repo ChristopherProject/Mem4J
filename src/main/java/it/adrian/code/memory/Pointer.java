@@ -10,6 +10,7 @@ import it.adrian.code.platform.NativeAccess;
 import it.adrian.code.platform.ProcessSession;
 import it.adrian.code.platform.windows.WindowsProcessSession;
 
+import java.lang.ref.Cleaner;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.Charset;
@@ -17,7 +18,10 @@ import java.nio.charset.StandardCharsets;
 
 public class Pointer implements AutoCloseable {
 
+    private static final Cleaner CLEANER = Cleaner.create();
+
     private final ProcessSession session;
+    private final Cleaner.Cleanable cleanable;
     public String processName;
     public String moduleName;
     private long baseAddress;
@@ -29,6 +33,27 @@ public class Pointer implements AutoCloseable {
         this.session = session;
         this.baseAddress = baseAddress;
         this.offset = 0L;
+        this.cleanable = CLEANER.register(this, new SessionReleaser(session));
+    }
+
+    /**
+     * Cleaner action — releases the session's reference count when the
+     * {@code Pointer} becomes phantom-reachable without an explicit
+     * {@code close()}. Must NOT capture the enclosing {@code Pointer}.
+     */
+    private static final class SessionReleaser implements Runnable {
+        private final ProcessSession session;
+
+        SessionReleaser(ProcessSession session) {
+            this.session = session;
+        }
+
+        @Override
+        public void run() {
+            if (session.release() == 0) {
+                NativeAccess.get().closeSession(session);
+            }
+        }
     }
 
     /**
@@ -253,7 +278,7 @@ public class Pointer implements AutoCloseable {
     }
 
     public Pointer copy() {
-        Pointer ptr = new Pointer(session, baseAddress);
+        Pointer ptr = new Pointer(session.retain(), baseAddress);
         ptr.offset = offset;
         ptr.moduleName = moduleName;
         ptr.processName = processName;
@@ -291,12 +316,20 @@ public class Pointer implements AutoCloseable {
     }
 
     /**
-     * Release the underlying OS handle ({@code CloseHandle} on Windows,
-     * closing of {@code /proc/<pid>/mem} on Linux).
+     * Decrement the session's reference count. When this {@code Pointer} is the
+     * last live view onto the underlying handle, the OS resource is released
+     * ({@code CloseHandle} on Windows, {@code /proc/<pid>/mem} fd closed on
+     * Linux). Calling {@code close()} on a copy is therefore safe even if other
+     * sibling {@code Pointer}s are still in use — they will keep working until
+     * the last one is closed.
+     * <p>
+     * The method is idempotent: subsequent calls are no-ops. If the
+     * {@code Pointer} becomes garbage without an explicit {@code close()},
+     * a {@link Cleaner} performs the same release on a background thread.
      */
     @Override
     public void close() {
-        NativeAccess.get().closeSession(session);
+        cleanable.clean();
     }
 
     @Override

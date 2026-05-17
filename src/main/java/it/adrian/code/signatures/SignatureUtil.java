@@ -5,6 +5,7 @@ import com.sun.jna.Pointer;
 import com.sun.jna.platform.win32.Kernel32;
 import com.sun.jna.platform.win32.WinNT;
 import com.sun.jna.ptr.IntByReference;
+import it.adrian.code.platform.MemoryProtection;
 import it.adrian.code.platform.NativeAccess;
 import it.adrian.code.platform.ProcessSession;
 
@@ -13,7 +14,13 @@ public class SignatureUtil {
     /**
      * Scan a contiguous region of the target process for {@code sig}/{@code mask},
      * returning the absolute address of the first match, or 0 if none found.
-     * The region is read in chunks to handle ranges larger than what fits in a single buffer.
+     * <p>
+     * The range is walked in 64 KiB chunks. Pages that are unreadable
+     * ({@link MemoryProtection#NONE} or {@code null} from
+     * {@link NativeAccess#queryProtection}) are skipped <em>explicitly</em> —
+     * unreadable memory cannot contain a match by definition. If
+     * {@code queryProtection} returns {@code null} (backend cannot answer)
+     * the chunk is still attempted to preserve back-compat behaviour.
      */
     public static long findSignature(ProcessSession session, long start, long size, byte[] sig, String mask) {
         if (sig.length == 0 || mask.length() != sig.length) {
@@ -27,6 +34,13 @@ public class SignatureUtil {
         while (remaining > 0) {
             int toRead = (int) Math.min(buffer.length, remaining + sig.length - 1);
             if (toRead < sig.length) break;
+
+            MemoryProtection prot = na.queryProtection(session, cursor);
+            if (prot == MemoryProtection.NONE) {
+                cursor += chunk;
+                remaining -= chunk;
+                continue;
+            }
             if (!na.readMemory(session, cursor, buffer, toRead)) {
                 cursor += chunk;
                 remaining -= chunk;
